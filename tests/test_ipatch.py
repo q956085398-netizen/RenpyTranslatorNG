@@ -185,7 +185,8 @@ with open(os.path.join(gamedir, "tl", "chinese", "test.rpy"), "w", encoding="utf
             '    old "Landlady day"\n'
             '    new "Landlady day"\n')
 
-# ipatch 模块的 work_dir 指到 tmp
+# ipatch 模块的 work_dir 指到 tmp（模块尾部恢复，避免污染后续测试模块）
+_ipatch_real_work_dir = ipatch.work_dir
 ipatch.work_dir = lambda gb: os.path.join(tmp, "work")
 
 dump = {"labels_start_abc123": {"filename": "other.rpy", "lineno": 2,
@@ -279,6 +280,7 @@ check("跳过名单内取样文本也不改写",
       d3["labels_start_abc123"]["nodes"][0]["what"] == "I trust Diana this time")
 os.remove(os.path.join(tmp, "work", "ipatch_skip.json"))
 
+ipatch.work_dir = _ipatch_real_work_dir
 shutil.rmtree(tmp, ignore_errors=True)
 shutil.rmtree(os.path.join(ROOT, "work", "ipatch_test_game"), ignore_errors=True)
 

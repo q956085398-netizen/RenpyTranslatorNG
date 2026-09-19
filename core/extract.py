@@ -219,12 +219,17 @@ def gen_common_tl(game_base, language, log=print):
     from .util import esc_rpy, unesc_rpy
     gamedir = os.path.join(game_base, "game")
     dst = os.path.join(gamedir, "tl", language, "common.rpy")
-    # common.rpy 已存在则不重写（避免重复翻译），但仍走扫描以更新 layout 刷新文件
+    # common.rpy 已存在则不重写（避免重复翻译）；layout 刷新文件的更新
+    # 只在路线三（renpy/common 反编译扫描）进行
     skip_strings = os.path.isfile(dst)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     src = os.path.join(gamedir, "tl", "None", "common.rpym")
     if os.path.isfile(src):
+        # common.rpy 已存在时不得重写：否则已回填的译文会被清空
+        # （引擎对已有译文的 strings 同样跳过；layout 刷新只在路线三处理）
+        if skip_strings:
+            return 0
         game_olds = _existing_tl_olds(gamedir, language)
         out = ["translate %s strings:\n" % language]
         n = 0

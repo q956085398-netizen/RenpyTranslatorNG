@@ -1,0 +1,17 @@
+# 引擎 common 字符串样本（syntheng 的 gen_common_tl 转换输入）。
+# 三条字符串取自 Ren'Py 引擎（MIT 许可）随引擎分发的 UI 文案，作为引擎
+# 保真夹具使用，并覆盖 developer 文件（00console）被过滤的断言；非第三方
+# 游戏内容。
+translate None strings:
+
+    # renpy/common/00keymap.rpy:268
+    old "Skip"
+    new "Skip"
+
+    # renpy/common/00console.rpy:101
+    old "Console"
+    new "Console"
+
+    # renpy/common/00accessibility.rpy:120
+    old "Self-Voicing"
+    new "Self-Voicing"

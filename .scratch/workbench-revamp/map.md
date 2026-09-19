@@ -8,7 +8,7 @@
 | # | Title | Status | Blocked by |
 |----|-------|--------|------------|
 | 01 | 统一依赖与测试入口 | resolved | — |
-| 02 | 合成 Ren'Py 回归游戏 | ready-for-agent | 01 |
+| 02 | 合成 Ren'Py 回归游戏 | resolved | 01 |
 | 03 | 项目注册库与稳定项目身份 | ready-for-agent | 01 |
 | 04 | 旧数据自动迁移 | ready-for-agent | 03 |
 | 05 | 项目数据库:出现位置与译文记录 | ready-for-agent | 02, 03 |
@@ -25,6 +25,8 @@
 - 领域词汇与边界:根目录 `CONTEXT.md`
 - 架构决策:`docs/adr/0001`–`0005`
 - 完整计划与验收标准:`docs/PRODUCT-IMPROVEMENT-PLAN.md`
+- 合成回归夹具与引擎替身:`tests/fixtures/synthgames/`、`tests/syntheng.py`、
+  `tests/stubserver.py`（05–09 的测试直接复用,菜单字幕走 strings 语义见 02 号票 Answer）
 
 ## Log
 
@@ -32,3 +34,7 @@
 - 2026-09-20:01 已解决(统一依赖与测试入口):私有回归样本路径移出被跟踪代码、
   requirements-dev.lock 传递依赖锁定、.gitignore 增补;答案见 `issues/01-….md` 的 Answer。
   02 与 03 现在可并行。
+- 2026-09-20:02 已解决(合成 Ren'Py 回归游戏):synth_basic/synth_ipatch 两个合成游戏、
+  引擎替身 syntheng、本地 stub 服务连接、57 条断言的端到端回归;顺带修复 gen_common_tl
+  重写 common.rpy 与 test_ipatch work_dir 污染两个既有缺陷;答案见
+  `issues/02-….md` 的 Answer。05 现在只等 03。
