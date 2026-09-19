@@ -7,7 +7,7 @@
 
 | # | Title | Status | Blocked by |
 |----|-------|--------|------------|
-| 01 | 统一依赖与测试入口 | ready-for-agent | — |
+| 01 | 统一依赖与测试入口 | resolved | — |
 | 02 | 合成 Ren'Py 回归游戏 | ready-for-agent | 01 |
 | 03 | 项目注册库与稳定项目身份 | ready-for-agent | 01 |
 | 04 | 旧数据自动迁移 | ready-for-agent | 03 |
@@ -29,3 +29,6 @@
 ## Log
 
 - 2026-09-20:由 to-tickets 从 spec.md 生成 01–10,经用户批准发布。
+- 2026-09-20:01 已解决(统一依赖与测试入口):私有回归样本路径移出被跟踪代码、
+  requirements-dev.lock 传递依赖锁定、.gitignore 增补;答案见 `issues/01-….md` 的 Answer。
+  02 与 03 现在可并行。

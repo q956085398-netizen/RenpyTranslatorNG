@@ -15,14 +15,18 @@ Ren'Py 8.x 游戏可视化汉化工具。老版 RenpyTranslator 在 Ren'Py 8 上
 干净机器上（Python 3.10+ 已装）：
 
 ```bat
-pip install -r requirements-dev.txt && pytest
+pip install -r requirements-dev.txt -c requirements-dev.lock && pytest
 ```
 
-- `requirements.txt` / `requirements-dev.txt` 按版本锁定依赖，重复安装得到相同版本。
-- 测试套件全部使用临时目录，不引用本机绝对路径或真实游戏目录，统一退出码由 pytest 给出。
+- `requirements.txt` / `requirements-dev.txt` 按版本锁定直接依赖；`requirements-dev.lock`
+  钉住测试环境的全部传递依赖（约束文件），重复安装得到完全相同的版本。
+- 测试套件全部使用临时目录，被跟踪的测试代码不引用本机绝对路径或真实游戏目录，统一退出码由 pytest 给出。
 - 只跑界面（不跑测试）的环境装 `requirements.txt`（含 PySide6）即可。
-- 私有回归（引用开发者本机真实游戏样本、受版权保护不入库）默认跳过；
-  设 `NG_PRIVATE_REGRESSION=1` 后 `pytest tests/test_ipatch.py` 才会执行该部分。
+- 真实项目的私有回归（引用开发者本机回归样本、受版权保护不入库）默认跳过；仓库内不含任何本机绝对路径。
+  开发者把回归样本清单写进 gitignored 的 `tests/private_regression_cases.json`（`{"名称": "本机路径"}`），
+  再设 `NG_PRIVATE_REGRESSION=1` 运行 `pytest tests/test_ipatch.py` 才会执行该部分；
+  样本文件不存在或清单损坏时该部分整体跳过，不影响退出码；但清单损坏且已设
+  `NG_PRIVATE_REGRESSION=1` 时按失败处理，避免"回归通过"的假象。
 
 界面默认为深色主题，右上角 **🌙/☀** 按钮可在深色 / 浅色之间一键切换；
 按钮固定在页面顶端不随页面切换消失，选择保存在 `config.json` 的 `theme` 字段，下次启动沿用。

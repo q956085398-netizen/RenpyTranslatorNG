@@ -18,3 +18,7 @@ data/
 dist/
 build/
 *.spec
+
+# pytest 缓存与本机私有回归样本清单（真实游戏路径，绝不入库）
+.pytest_cache/
+tests/private_regression_cases.json

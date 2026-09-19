@@ -23,19 +23,25 @@ def check(name, cond, detail=""):
 
 
 # ---------- Part 1: 真实补丁解析 ----------
-# 本部分引用开发者本机的真实游戏样本（受版权保护，不随仓库分发）：
-# 默认跳过；设 NG_PRIVATE_REGRESSION=1 做本机私有回归时才运行。
+# 本部分引用开发者本机的真实项目回归样本（受版权保护，不入库）：样本路径只存放在
+# gitignored 的 tests/private_regression_cases.json（{"名称": "路径"}，名称仅作分组展示，
+# 如 rtl 是文件名不含 ipatch、靠内容特征识别的字典型关系补丁），仓库内不出现任何本机绝对路径。
+# 默认跳过；开发者建好该文件并设 NG_PRIVATE_REGRESSION=1 后才运行。
 print("=== Part 1: 真实 ipatch 文件解析 ===")
-CASES = {
-    "universal": r"《本机路径已脱敏》",
-    "another": r"《本机路径已脱敏》",
-    "dp": r"《本机路径已脱敏》",
-    "crossworlds": r"《本机路径已脱敏》",
-    "lat": r"《本机路径已脱敏》",
-    "sd": r"《本机路径已脱敏》",
-    # 字典型关系补丁：文件名不含 ipatch，靠内容特征识别
-    "rtl": r"《本机路径已脱敏》",
-}
+CASES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "private_regression_cases.json")
+CASES = {}
+_manifest_error = None
+if os.path.isfile(CASES_FILE):
+    try:
+        with open(CASES_FILE, encoding="utf-8") as f:
+            CASES = json.load(f)
+    except ValueError as e:
+        _manifest_error = "JSON 解析失败: %s" % e
+    if not _manifest_error and not isinstance(CASES, dict):
+        _manifest_error = "应为 {名称: 路径} 的 JSON 对象"
+    if _manifest_error:
+        CASES = {}
 
 
 def have(name):
@@ -48,7 +54,12 @@ def have(name):
 
 PRIVATE = os.environ.get("NG_PRIVATE_REGRESSION") == "1"
 if not PRIVATE:
-    print("[SKIP] 真实样本回归需要 NG_PRIVATE_REGRESSION=1（公开测试套件不引用本机游戏路径）")
+    print("[SKIP] 真实项目回归需要 NG_PRIVATE_REGRESSION=1 且存在 tests/private_regression_cases.json")
+elif _manifest_error:
+    # 开发者显式要求跑回归而清单损坏：必须报失败，不能静默跳过造成"回归通过"假象
+    check("回归样本清单可解析", False, _manifest_error)
+elif not CASES:
+    print("[SKIP] 未找到 tests/private_regression_cases.json（本机私有回归样本清单，不入库）")
 parsed = {}
 for name, p in (CASES.items() if PRIVATE else []):
     if not have(name):
