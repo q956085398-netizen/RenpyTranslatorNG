@@ -17,10 +17,14 @@ def app_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def work_dir(game_base):
-    """每个游戏的工作目录（存放提取结果、进度、词表等）。"""
-    name = os.path.basename(os.path.normpath(game_base)) or "game"
-    d = os.path.join(app_dir(), "work", re.sub(r'[\\/:*?"<>|]', "_", name))
+def store_dir(project_id):
+    """项目资产目录：按汉化项目的稳定身份存放（work/<项目身份>/）。
+
+    身份来自注册库登记的汉化项目（core.registry），调用方不允许用游戏目录
+    名称等任意值充当身份；不存在按目录名推导数据目录的入口。
+    """
+    safe = re.sub(r'[\\/:*?"<>|]', "_", str(project_id))
+    d = os.path.join(app_dir(), "work", safe)
     os.makedirs(d, exist_ok=True)
     return d
 

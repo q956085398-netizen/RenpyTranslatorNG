@@ -9,7 +9,7 @@
 |----|-------|--------|------------|
 | 01 | 统一依赖与测试入口 | resolved | — |
 | 02 | 合成 Ren'Py 回归游戏 | resolved | 01 |
-| 03 | 项目注册库与稳定项目身份 | ready-for-agent | 01 |
+| 03 | 项目注册库与稳定项目身份 | resolved | 01 |
 | 04 | 旧数据自动迁移 | ready-for-agent | 03 |
 | 05 | 项目数据库:出现位置与译文记录 | ready-for-agent | 02, 03 |
 | 06 | 单项目单写入任务协调器 | ready-for-agent | 05 |
@@ -38,3 +38,8 @@
   引擎替身 syntheng、本地 stub 服务连接、57 条断言的端到端回归;顺带修复 gen_common_tl
   重写 common.rpy 与 test_ipatch work_dir 污染两个既有缺陷;答案见
   `issues/02-….md` 的 Answer。05 现在只等 03。
+- 2026-09-20:03 已解决(项目注册库与稳定项目身份):core/registry.py 应用级 SQLite 注册库
+  (稳定 UUID + 游戏安装关联 + 唯一索引兜底)、util.store_dir 按身份存项目资产
+  (work/<游戏名> 推导入口已删除)、UI 经注册库登记/重新定位(用户确认,绝不按名合并);
+  15 项注册库测试 + 合成回归同名双路径隔离段;答案见 `issues/03-….md` 的 Answer。
+  04 与 05 现在可并行。

@@ -27,6 +27,8 @@ from core.pipeline import Project
 from core import fontpatch
 from core import library as gamelib
 from core import relations as rel
+from core import registry as projreg
+from core import updates as upd
 from core.translator import DEFAULT_SYSTEM_PROMPT
 from core.util import read_json, write_json
 
@@ -1147,19 +1149,102 @@ class MainWindow(QMainWindow):
     def _pick_game(self):
         d = QFileDialog.getExistingDirectory(self, "选择游戏根目录")
         if d:
-            self.ed_game.setText(d)
+            self._set_game(d)
 
     def _pick_font(self):
         f, _ = QFileDialog.getOpenFileName(self, "选择字体", "C:/Windows/Fonts", "字体 (*.ttf *.ttc *.otf)")
         if f:
             self.ed_font.setText(f)
 
+    def _set_game(self, path):
+        """选择/切换游戏目录：校验、登记或定位其汉化项目（须在主线程调用）。
+
+        登记成功才写入界面与配置；版本号经 updates.local_version 一并记录到注册库。"""
+        path = os.path.normpath(path.strip())
+        if not os.path.isdir(os.path.join(path, "game")):
+            QMessageBox.warning(self, "无效目录",
+                                "所选目录不是 Ren'Py 游戏根目录（需包含 game/ 子目录）：\n%s" % path)
+            return False
+        try:
+            proj, action = self._resolve_project(path)
+        except Exception as e:
+            QMessageBox.warning(self, "项目登记失败", str(e))
+            return False
+        self.ed_game.setText(path)
+        self.cfg["last_game"] = path
+        self.cfg.save()
+        if action == "relocated":
+            self._toast("已重新定位汉化项目《%s》：沿用其全部项目资产" % proj["name"])
+        elif action == "created":
+            self._toast("已登记汉化项目《%s》" % proj["name"])
+        return True
+
+    def _resolve_project(self, base, prompt=True):
+        """打开/登记 base 对应的汉化项目，返回 (项目, 动作)。
+
+        动作 = existing（已登记）/ relocated（用户确认重新定位）/ created（新登记）。
+        注册库是项目身份的唯一入口：项目资产目录由项目身份派生，不再按目录名推导。
+        游戏目录被移动或改名后，旧项目会出现在"当前安装丢失"名单里——请用户确认
+        当前目录就是它的游戏安装（绝不按名称自动合并），确认后重新定位到同一项目。
+        所有项目任务启动前都在主线程调用本方法，工作线程内不再发生登记分支。
+        """
+        reg = projreg.Registry()
+        try:
+            cur = reg.find_by_path(base)
+            if cur is not None:
+                return cur, "existing"
+            if prompt and self.thread() is QThread.currentThread():
+                stale = reg.stale_projects()
+                if stale:
+                    picked = self._ask_relocate(stale, base)
+                    if picked is not None:
+                        return (reg.relocate(picked["id"], base,
+                                             version=self._install_version(base)),
+                                "relocated")
+            return (reg.create_project(gamelib.derive_name(base), base,
+                                       version=self._install_version(base)),
+                    "created")
+        finally:
+            reg.close()
+
+    def _install_version(self, base):
+        """游戏安装的本地版本（log.txt / options.rpy / 目录名），判不出则留空。"""
+        try:
+            return upd.local_version(base, gamelib.derive_name(base)) or None
+        except Exception:
+            return None
+
+    def _ask_relocate(self, stale, base):
+        """重新定位确认：返回被确认的旧汉化项目；用户否认/取消时返回 None（登记新项目）。"""
+        if len(stale) == 1:
+            p = stale[0]
+            ret = QMessageBox.question(
+                self, "重新定位汉化项目",
+                "汉化项目《%s》原来的游戏目录已不存在：\n%s\n\n"
+                "当前选择的目录是否就是它的新位置？\n\n"
+                "选「Yes」沿用该项目的提取结果、词汇表和译文；\n"
+                "选「No」把当前目录登记为新汉化项目。" % (p["name"], p["path"]),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            return p if ret == QMessageBox.StandardButton.Yes else None
+        labels = ["《%s》  原目录：%s" % (p["name"], p["path"]) for p in stale]
+        item, ok = QInputDialog.getItem(
+            self, "重新定位汉化项目",
+            "以下汉化项目原来的游戏目录已不存在。\n"
+            "当前目录是否属于其中某个项目？\n\n当前目录：%s\n\n"
+            "选择项目则沿用其全部资产；点「Cancel」则登记为新项目。" % base,
+            labels, 0, False)
+        if not ok:
+            return None
+        return stale[labels.index(item)]
+
     def _project(self):
         base = self.ed_game.text().strip()
         if not base or not os.path.isdir(os.path.join(base, "game")):
             raise RuntimeError("请先选择有效的游戏根目录（需包含 game/ 子目录）")
         self._collect()
-        return Project(self.cfg, base)
+        proj, _action = self._resolve_project(base)
+        return Project(self.cfg, base, proj["id"])
 
     def _run(self, fn):
         if self.worker and self.worker.isRunning():
@@ -1168,6 +1253,15 @@ class MainWindow(QMainWindow):
             return
         self._collect()
         self.cfg.save()
+        base = self.ed_game.text().strip()
+        if base and os.path.isdir(os.path.join(base, "game")):
+            # 项目任务的登记与"重新定位"确认一律在主线程完成（含目录移动后
+            # 直接运行步骤的情形），工作线程内只按已登记的项目身份执行
+            try:
+                self._resolve_project(base)
+            except Exception as e:
+                QMessageBox.warning(self, "项目登记失败", str(e))
+                return
         self.worker = Worker(fn)
         self.worker.sig_log.connect(self._on_log)
         self.worker.sig_prog.connect(self._on_prog)
@@ -1666,7 +1760,27 @@ class MainWindow(QMainWindow):
         self.chk_strings.setChecked(self.cfg.get("translate_strings", True))
         self.chk_autoupd.setChecked(self.cfg.get("auto_check_updates", True))
         self.ed_game.setText(self.cfg.get("last_game", ""))
+        self._restore_last_project()
         self._sync_scan_ui()
+
+    def _restore_last_project(self):
+        """启动恢复上次的游戏目录：只查找已登记的汉化项目并记录打开时间。
+
+        不登记、不弹窗：目录未登记（如升级首次启动）或目录已移动/改名时，
+        留待用户主动选择目录——届时才会发生登记或"重新定位"确认，
+        避免启动时静默创建汉化项目或打断启动流程。"""
+        last = self.ed_game.text().strip()
+        if not last or not os.path.isdir(os.path.join(last, "game")):
+            return
+        reg = projreg.Registry()
+        try:
+            cur = reg.find_by_path(last)
+            if cur is not None:
+                reg.touch(cur["id"])
+        except Exception:
+            pass
+        finally:
+            reg.close()
 
     def _collect(self):
         e = self.cfg["engine"]

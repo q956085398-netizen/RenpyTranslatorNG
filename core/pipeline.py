@@ -7,7 +7,7 @@ import time
 from . import decompile, extract, fontpatch, ipatch, pystrings, relations, texttags, tlgen, uipatch
 from . import translator as xlator
 from . import unrpa
-from .util import fmt_exc, read_json, work_dir, write_json
+from .util import fmt_exc, read_json, store_dir, write_json
 
 TARGET_LANG_NAME = {"chinese": "简体中文"}
 
@@ -28,7 +28,7 @@ def _expand_translations(jobs, translations, dropped=None):
 
     文本表沿用作统计与兜底：同一原文的多个 key 只要任一已译，全部复用同一译文。
     key 表用于逐条精确回填——同一句英文在不同分支可能有各自的既有译法，
-    被人工排除补丁（work/<游戏>/ipatch_skip.json）的条目也要保住自己的译文，
+    被人工排除补丁（项目资产目录下的 ipatch_skip.json）的条目也要保住自己的译文，
     不能被同句的其它 key 覆盖。写出前顺带修复错乱的 Ren'Py 标签（如开标签写成
     {/i}）；{} 占位符数量不一致、或 [变量] 与原文对不上（大小写/名字被模型改写、
     甚至整个翻译掉——运行时 NameError）的译文直接弃用，宁可显示英文也不能崩游戏；
@@ -65,10 +65,16 @@ def _expand_translations(jobs, translations, dropped=None):
 
 
 class Project:
-    def __init__(self, cfg, game_base):
+    def __init__(self, cfg, game_base, project_id):
+        """project_id：注册库登记的汉化项目稳定身份（core.registry）。
+
+        项目资产（提取结果、词汇表、译文等）一律存放在按身份派生的项目资产目录
+        （work/<项目身份>/），与游戏目录名称、绝对路径无关；
+        UI 与测试都必须先经注册库登记再构造本类。"""
         self.cfg = cfg
         self.game_base = game_base
-        self.work = work_dir(game_base)
+        self.project_id = project_id
+        self.work = store_dir(project_id)
         self.language = cfg.get("language", "chinese")
         self._ov = None  # 最近一次 _jobs 构建出的 ipatch 覆盖（无补丁为 None）
 
@@ -78,7 +84,7 @@ class Project:
 
     def decompile(self, log, should_stop=None):
         summary = decompile.decompile(self.game_base, self.cfg.get("overwrite_rpyc", False), log, should_stop)
-        uipatch.patch_game(self.game_base, log)
+        uipatch.patch_game(self.game_base, self.work, log)
         return summary
 
     def extract_tl(self, log, should_stop=None):
@@ -87,11 +93,11 @@ class Project:
         n, tl_dir, json_path = extract.extract(self.game_base, self.language, log=log, should_stop=should_stop)
         shutil.copy2(json_path, os.path.join(self.work, "dump.json"))
         # ipatch 台词补丁：先解析（替换对/节点改写/补丁自有文本）
-        ov = ipatch.build_overlay(self.game_base, log=log, save=True)
+        ov = ipatch.build_overlay(self.game_base, self.work, log=log, save=True)
         # 补提取：官方机制看不到的 Python 字面量（数据驱动型游戏的界面文本）；
         # 补丁自有文本（输入提示词等）一并并入补充骨架
         try:
-            added = pystrings.write_skeleton(self.game_base, self.language,
+            added = pystrings.write_skeleton(self.game_base, self.work, self.language,
                                              dump_path=json_path, log=log,
                                              extra=(ov.extra if ov else None))
             if added:
@@ -124,7 +130,7 @@ class Project:
         # ipatch 补丁覆盖取样文本（只动副本）：AI 按玩家实际看到的补丁后台词
         # 推断关系，"Diana" 被补丁改成 "your mom" 的游戏不再推断出错
         try:
-            ov = ipatch.build_overlay(self.game_base)
+            ov = ipatch.build_overlay(self.game_base, self.work)
             if ov:
                 dump = ov.apply_dump(dump)
         except Exception:
@@ -151,7 +157,7 @@ class Project:
             include_strings=self.cfg.get("translate_strings", True),
             context_lines=ctx)
         # ipatch 台词补丁：把翻译源换成补丁后文本（tl 锚点保持原文不动）
-        self._ov = ipatch.build_overlay(self.game_base, log=None)
+        self._ov = ipatch.build_overlay(self.game_base, self.work, log=None)
         if self._ov:
             n = ipatch.overlay_jobs(jobs, self._ov)
             if n:
@@ -197,7 +203,7 @@ class Project:
                 log("    %s 多出 %s\n        %s" % (k, bad, t[:70]))
             if len(dropped) > 3:
                 log("    …其余 %d 条" % (len(dropped) - 3))
-            log("    多出的变量名改对（或删掉）后重跑本步即可回填；缓存仍在 work/<游戏>/translations.json")
+            log("    多出的变量名改对（或删掉）后重跑本步即可回填；译文仍在项目资产目录的 translations.json")
         log("⏱ 翻译总用时：%s" % _fmt_duration(time.monotonic() - t0))
         return n, missing
 

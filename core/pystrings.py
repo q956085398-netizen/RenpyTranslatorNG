@@ -14,7 +14,7 @@ import os
 import re
 
 from . import ipatch
-from .util import esc_rpy, is_display_text, unesc_rpy, work_dir
+from .util import esc_rpy, is_display_text, unesc_rpy
 
 # 字面量紧跟这些关键字参数名时是代码参数而非显示文本
 _KWARG_CODE = re.compile(
@@ -290,7 +290,7 @@ def _collect_tl_olds(game_base, language):
     return olds
 
 
-def _collect_skip(game_base, language, dump_path):
+def _collect_skip(dump_path, data_dir):
     """软去重集合：对白 dump 里的台词、译文缓存里已存在的条目。
 
     与这些重复的文本默认不收，但赋值/notify/return 行（运行期动态显示的数据）
@@ -310,7 +310,7 @@ def _collect_skip(game_base, language, dump_path):
                     # 构建菜单，同样的文本运行期走 strings 表，必须收录
         except Exception:
             pass
-    cache = os.path.join(work_dir(game_base), "translations.json")
+    cache = os.path.join(data_dir, "translations.json")
     if os.path.isfile(cache):
         try:
             with open(cache, "r", encoding="utf-8") as f:
@@ -322,10 +322,12 @@ def _collect_skip(game_base, language, dump_path):
     return skip
 
 
-def scan_strings(game_base, dump_path=None, language="chinese"):
-    """扫描源码，返回按首次出现顺序去重的候选原文列表。"""
+def scan_strings(game_base, data_dir, dump_path=None, language="chinese"):
+    """扫描源码，返回按首次出现顺序去重的候选原文列表。
+
+    data_dir：汉化项目的项目资产目录（读取既有译文做软去重）。"""
     gamedir = os.path.join(game_base, "game")
-    skip = _collect_skip(game_base, language, dump_path)
+    skip = _collect_skip(dump_path, data_dir)
     tl_olds = _collect_tl_olds(game_base, language)
     seen = set()
     out = []
@@ -401,16 +403,17 @@ def _write_runtime_filter(game_base):
         f.write(_RUNTIME_RPY)
 
 
-def write_skeleton(game_base, language, dump_path=None, log=print, extra=None):
+def write_skeleton(game_base, data_dir, language, dump_path=None, log=print, extra=None):
     """生成/合并补充骨架与运行时过滤器，返回本次新增条数。
 
+    data_dir：汉化项目的项目资产目录（读取既有译文做软去重）。
     extra：ipatch 补丁自有的玩家可见文本（输入提示词等），游戏源码里没有
     对应字面量，必须由调用方显式并入骨架一起翻译。
 
     重写时顺带自愈：剔除骨架里与官方 tl 重复定义的 old（会让 Ren'Py
     启动即崩）及骨架自身重复的条目，因此旧版本生成的坏文件重跑即可修复。
     """
-    found = scan_strings(game_base, dump_path, language)
+    found = scan_strings(game_base, data_dir, dump_path, language)
     if extra:
         have_f = set(found)
         for s in extra:

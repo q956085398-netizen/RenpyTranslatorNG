@@ -12,14 +12,14 @@
 
 字符串字面量用 _() 包装（官方提取靠它识别）；表达式/变量用 _ng_t() 包装
 （由 zz_ng_dyntrans.rpy 定义，非字符串或查不到译文时原样返回，绝无副作用）。
-原文件备份到工作目录。
+原文件备份到项目资产目录。
 """
 import os
 import re
 import shutil
 
 from . import ipatch
-from .util import _EXT, is_display_text, unesc_rpy, work_dir
+from .util import _EXT, is_display_text, unesc_rpy
 
 # 表达式包装函数名（由 zz_ng_dyntrans.rpy 提供，init -999 定义）
 EXPR_WRAP = "_ng_t"
@@ -490,11 +490,11 @@ def repair_wrapped_targets(game_base, log=print):
     return fixed
 
 
-def patch_game(game_base, log=print):
-    """返回 (修改文件数, 包装处数)。"""
+def patch_game(game_base, data_dir, log=print):
+    """返回 (修改文件数, 包装处数)。data_dir：项目资产目录（备份根）。"""
     repair_wrapped_targets(game_base, log)
     gamedir = os.path.join(game_base, "game")
-    backup_root = os.path.join(work_dir(game_base), "uipatch_backup")
+    backup_root = os.path.join(data_dir, "uipatch_backup")
     patched_files = wrapped = 0
     for root, dirs, files in os.walk(gamedir):
         dirs[:] = [d for d in dirs if d not in ("tl", "fonts_ng_backup", "fonts", "cache", "saves")]

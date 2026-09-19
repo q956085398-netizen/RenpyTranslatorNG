@@ -758,9 +758,8 @@ class LibraryPage(QWidget):
         elif chosen is a_open:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
         elif chosen is a_setcur:
-            self.win.ed_game.setText(path)
-            self.win._goto("flow")
-            self.win._toast("已设为当前项目：%s" % (entry.get("name") or path))
+            if self.win._set_game(path):
+                self.win._goto("flow")
         elif chosen is a_del:
             ret = QMessageBox.question(self, "从库中移除",
                                        "只从游戏库移除记录，不动游戏文件：\n%s" % path)

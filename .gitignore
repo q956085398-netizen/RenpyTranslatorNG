@@ -5,10 +5,11 @@ __pycache__/
 .venv/
 venv/
 
-# 本机数据：工作目录（提取结果/译文缓存/几十 GB 解包内容）、封面缓存、
-# 游戏库记录与配置（config.json 里有 API 密钥与 Cookie，绝不入库）
+# 本机数据：项目资产（提取结果/译文/几十 GB 解包内容）、封面缓存、
+# 项目注册库、游戏库记录与配置（config.json 里有 API 密钥与 Cookie，绝不入库）
 work/
 covers/
+registry.db
 config.json
 library.json
 data/

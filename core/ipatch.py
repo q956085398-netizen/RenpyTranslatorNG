@@ -28,7 +28,7 @@ import json
 import os
 import re
 
-from .util import read_json, unesc_rpy, work_dir, write_json
+from .util import read_json, unesc_rpy, write_json
 
 # .replace("旧", "新")：双/单引号 Python 字面量各一组（单行形态）
 _PAIR = re.compile(
@@ -365,23 +365,23 @@ class Overlay:
         return "、".join(parts)
 
 
-def _load_skip(game_base):
-    """可选跳过名单：work/<游戏>/ipatch_skip.json 里列出的 key / 块标识符不套用补丁。
+def _load_skip(data_dir):
+    """可选跳过名单：项目资产目录下 ipatch_skip.json 里列出的 key / 块标识符不套用补丁。
 
     字典型补丁按整句文本匹配、与说话人无关：补丁作者把 "[mname]…" 映射成 "son…"，
     那么女友、路人说同一句时也会被改成「儿子」。这类误伤在这里人工排除，被排除的
     条目按游戏原文翻译。文件格式：["块标识符", "块标识符:s1", ...] 或 {"keys": [...]}。"""
-    data = read_json(os.path.join(work_dir(game_base), "ipatch_skip.json"), []) or []
+    data = read_json(os.path.join(data_dir, "ipatch_skip.json"), []) or []
     if isinstance(data, dict):
         data = data.get("keys", [])
     return {str(k) for k in data if k}
 
 
-def build_overlay(game_base, log=print, save=False):
+def build_overlay(game_base, data_dir, log=print, save=False):
     """扫描并解析补丁；没有补丁返回 None，解析异常不抛出。
 
-    save=True 时把解析结果落盘到工作目录（提取阶段用；任务构建阶段频繁调用
-    不落盘）。"""
+    data_dir：汉化项目的项目资产目录。save=True 时把解析结果落盘到该目录
+    （提取阶段用；任务构建阶段频繁调用不落盘）。"""
     try:
         files, missing_src = discover(game_base)
         if missing_src and log:
@@ -407,7 +407,7 @@ def build_overlay(game_base, log=print, save=False):
         if not files:
             return None
         ov = Overlay([os.path.basename(p) for p in files], pairs, nodes, vars_, who,
-                     extra, text_map, _load_skip(game_base))
+                     extra, text_map, _load_skip(data_dir))
         if ov.empty:
             return None
         if log:
@@ -416,7 +416,7 @@ def build_overlay(game_base, log=print, save=False):
         # 落盘一份供排查/查看（不影响任何流程）
         if save:
             try:
-                write_json(os.path.join(work_dir(game_base), "ipatch.json"),
+                write_json(os.path.join(data_dir, "ipatch.json"),
                            {"sig": ov.sig, "files": ov.files, "pairs": ov.pairs,
                             "nodes": ov.nodes, "vars": ov.vars, "who": ov.who,
                             "extra": ov.extra, "text_map": ov.text_map,

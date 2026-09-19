@@ -185,9 +185,8 @@ with open(os.path.join(gamedir, "tl", "chinese", "test.rpy"), "w", encoding="utf
             '    old "Landlady day"\n'
             '    new "Landlady day"\n')
 
-# ipatch 模块的 work_dir 指到 tmp（模块尾部恢复，避免污染后续测试模块）
-_ipatch_real_work_dir = ipatch.work_dir
-ipatch.work_dir = lambda gb: os.path.join(tmp, "work")
+# 项目资产目录：测试全程使用 tmp 下的固定目录，模块尾部清理，避免污染真实 work/
+WORK = os.path.join(tmp, "work")
 
 dump = {"labels_start_abc123": {"filename": "other.rpy", "lineno": 2,
                                 "nodes": [{"type": "say", "who": "e",
@@ -196,7 +195,7 @@ dump = {"labels_start_abc123": {"filename": "other.rpy", "lineno": 2,
 jobs, tl_files = tlgen.build_jobs(game, "chinese", dump, include_strings=True, context_lines=1)
 check("jobs built", len(jobs) == 2, "got %d" % len(jobs))
 
-ov = ipatch.build_overlay(game, log=print)
+ov = ipatch.build_overlay(game, WORK, log=print)
 check("overlay built", ov is not None)
 if ov:
     cnt = ipatch.overlay_jobs(jobs, ov)
@@ -248,7 +247,7 @@ check("storypatch 不误判为补丁",
       not ipatch.is_patch_file(os.path.join(gamedir, "storypatch.rpy")))
 
 # write_skeleton 接收补丁自有文本（输入提示词）并并入骨架；运行时文件含 input 包装
-added = pystrings.write_skeleton(game, "chinese", extra=["(default is Sister).", "(default is Sister)."])
+added = pystrings.write_skeleton(game, WORK, "chinese", extra=["(default is Sister).", "(default is Sister)."])
 skel = open(os.path.join(gamedir, "tl", "chinese", "zz_ng_pystrings.rpy"), encoding="utf-8").read()
 check("extra merged once", added >= 1 and skel.count('old "(default is Sister)."') == 1)
 rt = open(os.path.join(gamedir, "zz_ng_dyntrans.rpy"), encoding="utf-8").read()
@@ -264,7 +263,7 @@ check("dump patched copy",
 os.makedirs(os.path.join(tmp, "work"), exist_ok=True)
 json.dump(["labels_start_abc123"], open(os.path.join(tmp, "work", "ipatch_skip.json"),
                                         "w", encoding="utf-8"), ensure_ascii=False)
-ov3 = ipatch.build_overlay(game, log=print)
+ov3 = ipatch.build_overlay(game, WORK, log=print)
 check("skip overlay built", ov3 is not None and ov3.skip_keys == {"labels_start_abc123"})
 check("skip 不影响整体指纹（避免全量重译）", ov3.sig == ov.sig)
 jobs3, _tf3 = tlgen.build_jobs(game, "chinese", dump, include_strings=True, context_lines=1)
@@ -280,7 +279,6 @@ check("跳过名单内取样文本也不改写",
       d3["labels_start_abc123"]["nodes"][0]["what"] == "I trust Diana this time")
 os.remove(os.path.join(tmp, "work", "ipatch_skip.json"))
 
-ipatch.work_dir = _ipatch_real_work_dir
 shutil.rmtree(tmp, ignore_errors=True)
 shutil.rmtree(os.path.join(ROOT, "work", "ipatch_test_game"), ignore_errors=True)
 

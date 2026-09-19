@@ -214,12 +214,12 @@ Sister/Mother；台词还原：整句换掉被和谐的原句）。补丁是**�
   不存在这些字面量，工具把它们收进 strings 骨架一起翻译，并在运行时给 `renpy.input`
   套一层译文表包装（包装在补丁的猴子补丁内侧，补丁替换出的新提示词同样被翻译）；
 - **变量改写**（Crossworlds 的 `$ Landlady = "Mother"`）与说话人改名
-  （`Character_x.default_name`）：解析并记录到工作目录 `ipatch.json` 供排查；
+  （`Character_x.default_name`）：解析并记录到项目资产目录 `ipatch.json` 供排查；
 - **整句映射字典**（猴子补丁 `renpy.exports.say` + `replacements = {"原文": "补丁后"}`
   的关系补丁，文件名常是 `patch.rpy`）：按**整句精确匹配**覆盖翻译源（字典条目之间
   大量互为子串，绝不能走 replace 链）。这类补丁不看说话人，作者把 `"[mname]…"`
   映射成 `"son…"` 时，女友/路人说同一句也会变成「儿子」——这类误伤写进
-  `work/<游戏>/ipatch_skip.json`（数组，元素是块标识符或 `块id:s1` 形式）即可人工排除，
+  项目资产目录下的 `ipatch_skip.json`（数组，元素是块标识符或 `块id:s1` 形式）即可人工排除，
   被排除的条目按游戏原文翻译。
 
 安全性设计：译文仍按**原文**写回 tl（对白运行期按节点标识符查表、与文本无关，strings
@@ -243,7 +243,10 @@ Sister/Mother；台词还原：整句换掉被和谐的原句）。补丁是**�
   `tests/test_texttags.py`（标签校验）、`tests/test_ng_textmap.py`（关系词显示层映射）、
   `tests/test_ratings.py`（名字匹配/评分解析）、
   `tests/test_updates.py`（版本号拆解与「有新版本」判定），跑法 `py -X utf8 tests/test_xxx.py`
-- `work/<游戏名>/` 每游戏的进度数据：`dump.json`（提取结果）、`glossary.json`（词汇表）、
+- `registry.db` 应用级项目注册库：汉化项目的稳定身份（UUID）及其游戏安装关联
+  （路径、版本）；项目资产按项目身份存放，与游戏目录名称、绝对路径无关，
+  目录改名/移动后经确认重新定位即可继续使用原有资产
+- `work/<项目身份>/` 每个汉化项目的项目资产：`dump.json`（提取结果）、`glossary.json`（词汇表）、
   `relations.json`（人物关系）、`relation_words.json`（关系词显示表）、
   `translations.json`（译文缓存，可断点续翻）、
   `ipatch.json`（解析出的 ipatch 补丁规则，供排查）

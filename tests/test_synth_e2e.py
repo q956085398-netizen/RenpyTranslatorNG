@@ -10,7 +10,7 @@ stub 服务连接翻译（本地 HTTP，零费用零网络）→ 回填 → 再�
 （转义/标签/插值）、字符串字面量说话人、ipatch 各种覆盖形式、多主角与玩家
 自填关系词、引擎 common 字符串（含 developer 文件过滤）。
 
-测试全程使用临时目录（work_dir 经 app_dir 重定向），不触碰真实 work/ 数据。
+测试全程使用临时目录（app_dir 重定向：注册库与项目资产目录都落在临时目录），不触碰真实 work/ 数据。
 """
 import json
 import os
@@ -22,7 +22,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from core import extract, ipatch, pipeline, tlgen, util  # noqa: E402
+from core import extract, ipatch, pipeline, registry, tlgen, util  # noqa: E402
 from tests import syntheng, stubserver  # noqa: E402
 
 failures = []
@@ -61,6 +61,19 @@ def make_cfg(base_url, font_path):
         "apply_lang_entry": True,
         "translate_strings": True,
     }
+
+
+def register(game, name):
+    """把合成游戏登记为汉化项目（注册库随 app_dir 重定向到临时目录）。"""
+    reg = registry.Registry()
+    try:
+        return reg.create_project(name, game)
+    finally:
+        reg.close()
+
+
+def make_project(cfg, game, name):
+    return pipeline.Project(cfg, game, register(game, name)["id"])
 
 
 def jobs_by_key(game, dump_path):
@@ -123,13 +136,16 @@ with open(FONT_PATH, "wb") as f:
 
 _orig_extract = extract.extract
 extract.extract = syntheng.extract_for_test  # 引擎替身：合成游戏无进程可注入
-util.app_dir = lambda: TMP  # work_dir 随之指向临时目录
+util.app_dir = lambda: TMP  # 注册库与项目资产目录随之指向临时目录
 try:
     game = copy_game("synth_basic")
     cfg = make_cfg(stub.base_url, FONT_PATH)
-    p = pipeline.Project(cfg, game)
+    p = make_project(cfg, game, "synth_basic")
 
-    check("工作目录重定向到临时目录", p.work == os.path.join(TMP, "work", "synth_basic"),
+    check("项目数据目录按项目身份存放（不再由目录名推导）",
+          os.path.dirname(p.work) == os.path.join(TMP, "work")
+          and os.path.basename(p.work) == p.project_id
+          and "synth_basic" not in p.work,
           p.work)
 
     # ---------- 提取（引擎替身 + 补提取 + 补丁解析，走真实 extract_tl） ----------
@@ -315,14 +331,14 @@ try:
     }).start()
     game2 = copy_game("synth_ipatch")
     cfg2 = make_cfg(stub2.base_url, "")
-    p2 = pipeline.Project(cfg2, game2)
+    p2 = make_project(cfg2, game2, "synth_ipatch")
 
     p2.extract_tl(log=lambda m: None)
     dump2_path = os.path.join(p2.work, "dump.json")
     check("ipatch 解析结果落盘",
           os.path.isfile(os.path.join(p2.work, "ipatch.json")))
 
-    ov = ipatch.build_overlay(game2, log=None)
+    ov = ipatch.build_overlay(game2, p2.work, log=None)
     check("五种补丁机制全部解析",
           ov is not None and len(ov.pairs) >= 4 and len(ov.text_map) == 2
           and len(ov.nodes) == 1 and ov.vars.get("Landlady") == "Mother"
@@ -377,6 +393,73 @@ try:
 except Exception as e:  # noqa: BLE001
     import traceback
     check("synth_ipatch 端到端流程无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
+# 工单 03：同名游戏、不同路径 —— 项目身份隔离（串数据为 0）
+# =====================================================================
+try:
+    reg = registry.Registry()   # app_dir 已重定向：注册库落在临时目录
+    gameA = os.path.join(TMP, "packA", "My Game")
+    gameB = os.path.join(TMP, "packB", "My Game")
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), gameA)
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), gameB)
+    pa_id = reg.create_project("My Game", gameA)["id"]
+    pb_id = reg.create_project("My Game", gameB)["id"]
+    check("同名游戏两个安装登记为两个互不相干的项目", pa_id != pb_id
+          and reg.find_by_path(gameA)["id"] == pa_id
+          and reg.find_by_path(gameB)["id"] == pb_id)
+    reg.close()
+
+    cfgA = make_cfg(stub.base_url, "")
+    cfgB = make_cfg(stub.base_url, "")
+    cfgB["apply_font"] = False
+    cfgB["apply_lang_entry"] = False
+    pa = pipeline.Project(cfgA, gameA, pa_id)
+    pb = pipeline.Project(cfgB, gameB, pb_id)
+
+    pa.extract_tl(log=lambda m: None)
+    pb.extract_tl(log=lambda m: None)
+    check("同名游戏的两个项目数据目录完全独立",
+          pa.work != pb.work
+          and os.path.dirname(pa.work) == os.path.dirname(pb.work) == os.path.join(TMP, "work")
+          and "My Game" not in pa.work and "My Game" not in pb.work,
+          "%s | %s" % (pa.work, pb.work))
+
+    # A 端写入词汇表和译文标记；B 端必须什么都看不到
+    util.write_json(os.path.join(pa.work, "glossary.json"),
+                    [{"en": "vale", "cn": "幽谷（A 项目专用）"}])
+    util.write_json(os.path.join(pa.work, "translations.json"),
+                    {"k_marker_A": "A 项目的译文"})
+    check("B 项目库看不到 A 的词汇表与译文",
+          not os.path.isfile(os.path.join(pb.work, "glossary.json"))
+          and not os.path.isfile(os.path.join(pb.work, "translations.json")))
+    check("B 的提取结果在自己的项目库里",
+          os.path.isfile(os.path.join(pb.work, "dump.json")))
+
+    # B 端按自己的译文回填同一英文（不同项目、不同译法），A 端分毫不动
+    dumpB = util.read_json(os.path.join(pb.work, "dump.json"))
+    jobsB, _tlb = tlgen.build_jobs(gameB, "chinese", dumpB, include_strings=True,
+                                   context_lines=2)
+    riverB = [j["key"] for j in jobsB if j["kind"] == "say"
+              and j["old"] == "The river remembers."]
+    check("两个项目对同一源文本得到结构一致的任务清单", len(riverB) == 2, repr(riverB))
+    util.write_json(os.path.join(pb.work, "translations.json"),
+                    {k: "河流记得（B 项目专用）。" for k in riverB})
+    pb.fill_partial(log=lambda m: None)
+
+    contentA = read(os.path.join(gameA, "game", "tl", "chinese", "script.rpy"))
+    contentB = read(os.path.join(gameB, "game", "tl", "chinese", "script.rpy"))
+    check("B 端回填的是 B 自己的译文", "河流记得（B 项目专用）。" in contentB)
+    check("A 的游戏与项目库不受 B 影响",
+          "河流记得（B 项目专用）。" not in contentA
+          and util.read_json(os.path.join(pa.work, "translations.json"))
+          == {"k_marker_A": "A 项目的译文"}
+          and util.read_json(os.path.join(pa.work, "glossary.json"))
+          == [{"en": "vale", "cn": "幽谷（A 项目专用）"}])
+except Exception as e:  # noqa: BLE001
+    import traceback
+    check("同名游戏隔离回归无异常", False, "%s: %s" % (type(e).__name__, e))
     traceback.print_exc()
 
 # =====================================================================
