@@ -1,0 +1,3 @@
+# 测试依赖（含应用运行依赖；纯测试环境只需要 requests，不必装 PySide6）
+requests==2.34.2
+pytest==8.4.2

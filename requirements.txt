@@ -1,0 +1,4 @@
+# 应用运行依赖（版本锁定：重复安装得到相同版本）
+# 测试只需要 requests（见 requirements-dev.txt）；PySide6 仅运行界面时需要
+requests==2.34.2
+PySide6==6.11.2

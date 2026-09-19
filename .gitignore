@@ -1,0 +1,20 @@
+# 生成物与本机数据不入库
+__pycache__/
+*.py[cod]
+*.tmp
+.venv/
+venv/
+
+# 本机数据：工作目录（提取结果/译文缓存/几十 GB 解包内容）、封面缓存、
+# 游戏库记录与配置（config.json 里有 API 密钥与 Cookie，绝不入库）
+work/
+covers/
+config.json
+library.json
+data/
+*.log
+
+# 打包产物
+dist/
+build/
+*.spec
