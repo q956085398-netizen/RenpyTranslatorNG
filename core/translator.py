@@ -371,10 +371,15 @@ def build_system_prompt(target_lang, glossary_hits, relation_hits, names_line=""
 
 
 def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="简体中文",
-                   progress=None, should_stop=None, log=print):
-    """翻译 jobs（build_jobs 的输出）。增量保存到 work_path，返回 translations 字典。"""
+                   progress=None, should_stop=None, log=print, retranslate_keys=None):
+    """翻译 jobs（build_jobs 的输出）。增量保存到 work_path，返回 translations 字典。
+
+    retranslate_keys：要求重新翻译的任务 key（用户对具体译文发起的重译请求）。
+    这些 key 不吃同文去重缓存——即使同原文的其它 key 已有译文也要单独请求，
+    请求结果由调用方决定去向（人工确认的译文只进候选）。"""
     translations = read_json(work_path, {}) or {}
     lock = threading.Lock()
+    retrans = set(retranslate_keys or ())
 
     # 相同文本去重：一次翻译，多处复用（同句同译，天然保证一致性）
     # 断点续翻：同一文本的任意 key 已有译文即视为已译（即使上次中途退出没来得及展开）
@@ -386,6 +391,8 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
     for text, keys in text_map.items():
         done = None
         for k in keys:
+            if k in retrans:
+                continue  # 请求重译的 key 不复用同文缓存，稍后单独请求
             v = translations.get(k)
             if not v or v.count("{}") != text.count("{}"):
                 continue
@@ -399,14 +406,18 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
             break
         if done:
             for k in keys:
-                translations.setdefault(k, done)
+                if k not in retrans:
+                    translations.setdefault(k, done)
         else:
             dedup[keys[0]] = text
+        for k in keys:
+            if k in retrans:
+                dedup[k] = text
 
     todo_keys = list(dedup.keys())
     who_ctx = {j["key"]: (j.get("who", ""), j.get("ctx") or ([], [])) for j in jobs}
     total_all = len(text_map)
-    done_all = total_all - len(todo_keys)
+    done_all = max(0, total_all - len(todo_keys))
     if progress and total_all:
         progress(done_all, total_all)
 
@@ -534,12 +545,14 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
         # 去重展开：同一文本里还没有译文的 key 复用已有译文。
         # 已有自己译文的 key 绝不覆盖——否则「同一句英文在不同分支的既有译法」和
         # 被人工排除补丁（ipatch_skip.json）的条目会被一起抹平成同一条译文。
+        # 请求重译的 key 不参与复用：要么拿到自己的新结果，要么留给下一轮重试。
         # 放在 finally 里，熔断中止时也要把已完成的部分存下来（断点续翻靠它）
         for text, keys in text_map.items():
             t = next((translations[k] for k in keys if translations.get(k)), None)
             if t:
                 for k in keys:
-                    translations.setdefault(k, t)
+                    if k not in retrans:
+                        translations.setdefault(k, t)
         write_json(work_path, translations)
     if interp_bad[0]:
         log("⚠ 本次有 %d 条译文的 [变量] 与原文对不上，回填时会被拒用（这些行先显示英文）；"

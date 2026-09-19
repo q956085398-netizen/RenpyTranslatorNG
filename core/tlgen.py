@@ -113,7 +113,7 @@ def build_jobs(game_base, language, dump, include_strings=True, context_lines=2)
                 if not entry:
                     continue
                 had_content = True
-                say_i = cap_i = 0
+                say_i = 0
                 for node in entry.get("nodes", []):
                     if node["type"] == "say":
                         # 找到本块内下一个含引号的活动行
@@ -123,17 +123,18 @@ def build_jobs(game_base, language, dump, include_strings=True, context_lines=2)
                                 pre, nxt = ctx_map.get((entry["filename"], entry["lineno"]), ([], []))
                                 jobs.append({"key": ("%s:s%d" % (bid, say_i)) if say_i else bid,
                                              "kind": "say", "file": rel, "old": old,
-                                             "who": node.get("who", ""), "ctx": (pre, nxt)})
+                                             "who": node.get("who", ""), "ctx": (pre, nxt),
+                                             "src_file": entry["filename"],
+                                             "src_line": entry["lineno"]})
                                 say_i += 1
                                 live = live[live.index(k) + 1:]
                                 break
                         continue
-                    if node["type"] == "menu":
-                        for ci, cap in enumerate(node.get("captions", [])):
-                            if not cap:
-                                continue
-                            jobs.append({"key": "%s:c%d" % (bid, ci), "kind": "caption", "file": rel,
-                                         "old": cap, "who": "", "ctx": ([], [])})
+                    # 菜单节点不生成任务：现代引擎（7.4–8.x）里菜单字幕经 strings
+                    # 机制翻译（dump 菜单节点只是 translate None 块的附属信息），
+                    # 字幕的出现位置标识就是 strings 任务 key（"S:<原文>"）。
+                    # 旧实现按节点重计序号（bid:c0/c1...），同一块中的多个菜单节点
+                    # 序号互相冲突，且该形态在真实引擎下不可达、回填从不处理。
             if had_content:
                 tl_files.append(path)
     return jobs, tl_files

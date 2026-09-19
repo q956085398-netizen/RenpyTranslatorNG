@@ -22,7 +22,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from core import extract, ipatch, pipeline, registry, tlgen, util  # noqa: E402
+from core import extract, ipatch, pipeline, project_store, registry, tlgen, util  # noqa: E402
 from tests import syntheng, stubserver  # noqa: E402
 
 failures = []
@@ -460,6 +460,101 @@ try:
 except Exception as e:  # noqa: BLE001
     import traceback
     check("同名游戏隔离回归无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
+# 工单 05：项目数据库 —— 出现位置稳定、独立分支、人工保护、迁移建议
+# =====================================================================
+try:
+    stub5 = stubserver.StubTranslator(table={
+        "The river remembers.": "河水记得。",
+    }).start()
+    game5 = os.path.join(TMP, "games", "synth_basic_store")
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game5)
+    cfg5 = make_cfg(stub5.base_url, "")
+    p5 = make_project(cfg5, game5, "synth_basic_store")
+
+    p5.extract_tl(log=lambda m: None)
+    dump5_path = os.path.join(p5.work, "dump.json")
+    p5.translate(log=lambda m: None)
+    check("项目库随翻译建立（project.db 在项目资产目录）",
+          os.path.isfile(os.path.join(p5.work, "project.db")))
+    store5 = p5.store()
+    jobs5 = jobs_by_key(game5, dump5_path)
+    expect_n = sum(1 for j in jobs5.values() if j.get("old"))
+    st5 = store5.stats()
+    check("全部出现位置同步入库且都有当前译文记录（可对账）",
+          st5["occurrences"] == expect_n and st5["currents"] == expect_n, st5)
+
+    river5 = sorted(k for k, j in jobs5.items()
+                    if j["kind"] == "say" and j["old"] == "The river remembers.")
+    check("同一英文原文的两个分支出现位置各自入库", len(river5) == 2)
+    check("译文记录带来源与结构指纹/源文本快照",
+          all(store5.get_current(k)["source"] == "model"
+              and store5.get_current(k)["fingerprint"]
+              and store5.get_current(k)["source_text"] for k in river5))
+
+    # 出现位置标识稳定：相同提取结果再次同步，零变化（幂等）
+    recs5 = [project_store.record_from_job(j) for j in jobs5.values() if j.get("old")]
+    rep5 = store5.sync_occurrences(recs5)
+    check("再次同步相同提取结果幂等（出现位置标识稳定）",
+          rep5["added"] == 0 and rep5["changed"] == 0 and rep5["removed"] == 0
+          and rep5["demoted"] == 0, rep5)
+
+    # ---------- 独立分支 + 人工保护：一支人工定稿，重译结果只进候选 ----------
+    k_fixed, k_redo = river5
+    store5.set_human_translation(k_fixed, "河水记得（定稿）。")
+    store5.request_retranslation(k_fixed)
+    store5.request_retranslation(k_redo)
+    stub5.table["The river remembers."] = "河水的新译本。"
+    p5.translate(log=lambda m: None)
+    cur_fixed = store5.get_current(k_fixed)
+    check("人工定稿的译文在重新翻译后保持为当前译文",
+          cur_fixed["text"] == "河水记得（定稿）。" and cur_fixed["confirmed"] is True
+          and cur_fixed["source"] == "human")
+    check("人工译文的重译结果进入候选译文（被替换的旧译文也保留为候选版本）",
+          "河水的新译本。" in [c["text"] for c in store5.candidates(k_fixed)]
+          and store5.get_current(k_fixed)["text"] == "河水记得（定稿）。")
+    cur_redo = store5.get_current(k_redo)
+    check("未确认译文的重译按新结果更新（来源仍为模型）",
+          cur_redo["text"] == "河水的新译本。" and cur_redo["source"] == "model")
+    check("重译请求标记已清除", store5.retranslation_requested() == [])
+    content5 = read(os.path.join(game5, "game", "tl", "chinese", "script.rpy"))
+    check("同一英文的两个分支独立回填各自的译文",
+          content5.count('e "河水记得（定稿）。"') == 1
+          and content5.count('e "河水的新译本。"') == 1,
+          "定稿=%d 新译=%d" % (content5.count('e "河水记得（定稿）。"'),
+                              content5.count('e "河水的新译本。"')))
+
+    # ---------- 源文本变化：旧译文降为迁移建议，标识保持稳定 ----------
+    fam_key = next(k for k, j in jobs5.items() if j["old"] == "Family is family.")
+    fam_text = store5.get_current(fam_key)["text"]
+    script5 = os.path.join(game5, "game", "script.rpy")
+    with open(script5, "r", encoding="utf-8") as f:
+        src5 = f.read()
+    with open(script5, "w", encoding="utf-8") as f:
+        f.write(src5.replace('m "Family is family."', 'm "Family is everything."'))
+    p5.extract_tl(log=lambda m: None)
+    p5.estimate(log=lambda m: None)  # 触发任务构建 -> 出现位置同步
+    check("源文本变化后旧出现位置不再持有当前译文",
+          store5.get_current(fam_key) is None)
+    sug = next(s for s in store5.suggestions() if s["occurrence_id"] == fam_key)
+    check("旧译文降为迁移建议，带旧文本快照与来源说明",
+          sug["text"] == fam_text and sug["source_text"] == "Family is family."
+          and (sug["note"] or "").strip() != "", sug["note"])
+    jobs5b = jobs_by_key(game5, dump5_path)
+    fam_new = [k for k, j in jobs5b.items() if j["old"] == "Family is everything."]
+    check("改写后的文本成为新出现位置（尚无当前译文）",
+          len(fam_new) == 1 and store5.get_current(fam_new[0]) is None)
+    river_after = sorted(k for k, j in jobs5b.items()
+                         if j["kind"] == "say" and j["old"] == "The river remembers.")
+    check("未受影响的出现位置标识在再次提取后保持稳定",
+          river_after == river5
+          and store5.get_current(k_fixed)["text"] == "河水记得（定稿）。")
+    stub5.stop()
+except Exception as e:  # noqa: BLE001 —— 任何环节失败都要记录而不是中断其余断言输出
+    import traceback
+    check("工单 05 项目库回归无异常", False, "%s: %s" % (type(e).__name__, e))
     traceback.print_exc()
 
 # =====================================================================

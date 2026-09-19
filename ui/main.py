@@ -765,7 +765,8 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.lb_search.setText("加载失败：%s（先执行提取和翻译）" % e)
                 return False
-        trans = read_json(os.path.join(p.work, "translations.json"), {}) or {}
+        store = p.ensure_store(jobs)
+        trans = store.currents()
         groups, bytext = [], {}
         for j in jobs:
             if not j.get("old"):
@@ -784,6 +785,7 @@ class MainWindow(QMainWindow):
                     g["trans"] = t
                     break
         self._edit_groups = groups
+        self._edit_store = store
         self._edit_path = os.path.join(p.work, "translations.json")
         done = sum(1 for g in groups if g["trans"])
         self.lb_search.setText("已载入：%d 条唯一文本，其中已译 %d 条。输入关键词开始搜索" % (len(groups), done))
@@ -878,12 +880,15 @@ class MainWindow(QMainWindow):
         self._run(self._op_repair)
 
     def _edit_persist(self, groups):
-        """把分组译文写回 translations.json（该组所有 key 同步，保证续翻不再重译）。"""
-        trans = read_json(self._edit_path, {}) or {}
+        """把分组译文写回项目库（人工译文，带确认状态；该组所有 key 同步，
+        保证续翻不再重译），并刷新派生镜像 translations.json。"""
+        store = getattr(self, "_edit_store", None)
+        if store is None:
+            return
         for g in groups:
             for k in g["keys"]:
-                trans[k] = g["trans"]
-        write_json(self._edit_path, trans)
+                store.set_human_translation(k, g["trans"])
+        write_json(self._edit_path, store.currents())
 
     def _page_settings(self):
         page = QWidget()
@@ -1390,23 +1395,32 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
             return
-        path = os.path.join(p.work, "translations.json")
-        if not os.path.isfile(path):
+        store = p.store()
+        has_cache = bool(store.currents()) or os.path.isfile(
+            os.path.join(p.work, "translations.json"))
+        if not has_cache:
             self._toast("当前游戏没有译文缓存")
             return
         ret = QMessageBox.question(
             self,
             "确认清空译文缓存",
-            "即将删除全部本地译文进度（translations.json）。\n"
-            "已翻译的内容将全部丢失，重跑第5步会全文重新翻译。\n\n"
+            "即将清空全部未确认的本地译文记录（旧文件备份为 translations.json.bak）。\n"
+            "人工确认过的译文会保留，不会被清空。\n"
+            "重跑第5步会重新翻译未确认的内容。\n\n"
             "确定要继续吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if ret != QMessageBox.Yes:
             return
-        os.replace(path, path + ".bak")
-        self._toast("译文缓存已清空（备份为 translations.json.bak），重跑第5步即全文重译")
+        kept = store.clear_currents()
+        path = os.path.join(p.work, "translations.json")
+        if os.path.isfile(path):
+            os.replace(path, path + ".bak")
+        if kept:
+            self._toast("译文缓存已清空；%d 条人工确认的译文已保留，重跑第5步即重译其余内容" % kept)
+        else:
+            self._toast("译文缓存已清空（备份为 translations.json.bak），重跑第5步即全文重译")
 
     def _op_all(self, log, prog, stop, confirm=None):
         p = self._project()

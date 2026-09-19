@@ -246,10 +246,12 @@ Sister/Mother；台词还原：整句换掉被和谐的原句）。补丁是**�
 - `registry.db` 应用级项目注册库：汉化项目的稳定身份（UUID）及其游戏安装关联
   （路径、版本）；项目资产按项目身份存放，与游戏目录名称、绝对路径无关，
   目录改名/移动后经确认重新定位即可继续使用原有资产
-- `work/<项目身份>/` 每个汉化项目的项目资产：`dump.json`（提取结果）、`glossary.json`（词汇表）、
+- `work/<项目身份>/` 每个汉化项目的项目资产：`project.db`（项目数据库：文本出现位置与
+  译文记录的唯一可信来源——记录来源（模型/人工/迁移/导入）、人工确认状态、候选译文
+  版本与迁移建议）、`dump.json`（提取结果）、`glossary.json`（词汇表）、
   `relations.json`（人物关系）、`relation_words.json`（关系词显示表）、
-  `translations.json`（译文缓存，可断点续翻）、
-  `ipatch.json`（解析出的 ipatch 补丁规则，供排查）
+  `translations.json`（项目库的派生镜像文件：升级时一次性导入旧缓存，此后仅供
+  pystrings 软去重等读取）、`ipatch.json`（解析出的 ipatch 补丁规则，供排查）
 - `config.json` 全局设置（API key 等）；`library.json` 游戏库；`covers/` 游戏库封面缓存
 
 ## 说明

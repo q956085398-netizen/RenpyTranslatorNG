@@ -464,14 +464,14 @@ def drop_stale_cache(jobs, ov, trans_path, log=print):
     缓存按任务 key 存译文，key 不含文本内容；补丁改动会改变翻译源文本，
     因此补丁指纹变化时，所有"源文本被补丁改过"（orig != old）的任务的缓存
     全部作废重译。源文本未被补丁改过的任务不受影响，照常断点续翻。
-    返回是否发生了丢弃。"""
+    返回作废的任务 key 列表（无变化返回空列表）。"""
     if ov is None:
         # 补丁文件被移除：之前按补丁文本翻译的缓存无法逐条定位，只能提示
         sig_path = os.path.join(work_dir_from(trans_path), "ipatch_sig")
         if os.path.isfile(sig_path):
             log("注意：游戏的 ipatch 补丁已被移除。之前按补丁后文本翻译的缓存"
                 "不会自动失效，如需完全按未打补丁的原文重译，请清空译文缓存后重翻")
-        return False
+        return []
     sig_path = os.path.join(work_dir_from(trans_path), "ipatch_sig")
     prev = None
     if os.path.isfile(sig_path):
@@ -481,7 +481,7 @@ def drop_stale_cache(jobs, ov, trans_path, log=print):
         except OSError:
             prev = None
     if prev == ov.sig:
-        return False
+        return []
     stale = {j["key"] for j in jobs if j.get("orig") and j["orig"] != j["old"]}
     if stale:
         trans = read_json(trans_path, {}) or {}
@@ -498,7 +498,7 @@ def drop_stale_cache(jobs, ov, trans_path, log=print):
             f.write(ov.sig)
     except OSError:
         pass
-    return True
+    return dropped
 
 
 def work_dir_from(trans_path):
