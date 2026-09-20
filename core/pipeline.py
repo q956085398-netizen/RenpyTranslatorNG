@@ -122,12 +122,15 @@ class Project:
         return seed
 
     def _prepare_translation_run(self, log, jobs, trans_path, store):
-        """翻译/重译共用的准备：作废失效的补丁缓存，把种子译文写回镜像文件
-        （translate_jobs 以该文件做断点续翻与同文去重）。返回种子。"""
+        """翻译/重译共用的准备：作废失效的补丁缓存，刷新一次派生镜像，返回种子。
+
+        种子直接取自项目库（断点续翻与同文去重的依据）。模型结果按记录事务
+        逐批提交进项目库，任务运行期间不再整份写镜像文件；开跑前与结束后的
+        两次整份刷新只是派生镜像与项目库对账——进程中断后镜像最多滞后到上次
+        刷新，项目库始终是可信来源，下次导入/翻译自然修复。"""
         self._drop_stale_overlay_cache(log, jobs, trans_path, store)
-        seed = self._seed_translations(store)
-        write_json(trans_path, seed)
-        return seed
+        write_json(trans_path, store.currents())
+        return self._seed_translations(store)
 
     def _drop_stale_overlay_cache(self, log, jobs, trans_path, store):
         if not self._ov:
@@ -140,15 +143,31 @@ class Project:
             log("⚠ %d 条补丁覆盖的译文已人工确认，保持不变（不随补丁状态失效）"
                 % len(protected))
 
-    def _record_results(self, log, store, seed, trans):
-        """把本次模型结果登记进项目库（人工确认的译文只会得到候选译文）。"""
-        fresh = {k: v for k, v in trans.items() if seed.get(k) != v}
-        if not fresh:
-            return
-        recorded = store.record_model_results(fresh)
-        if recorded["candidate"]:
-            log("人工确认的译文全部保留：%d 条重译结果只进入候选译文，可比较后采用"
-                % recorded["candidate"])
+    def _model_commit(self, store):
+        """翻译任务按记录事务提交的入口：每个批次立即登记进项目库。
+
+        返回 (commit, conflicts)：commit 由 translator 在每批结果就绪时调用
+        （一次一小事务，进程中断时已提交批次保持一致）；conflicts 是与人工确认
+        译文冲突的出现位置清单——人工译文保持当前不动，任务结果进入候选译文
+        （带冲突说明），绝不两边覆盖，任务结束后由用户比较采用。"""
+        conflicts = []
+
+        def commit(batch):
+            conflicts.extend(store.record_model_results(batch)["conflicts"])
+
+        return commit, conflicts
+
+    def _translate_into_store(self, log, store, jobs, seed,
+                              progress=None, should_stop=None):
+        """翻译/重译共用的执行段：按记录事务逐批提交，结束后汇总冲突说明。"""
+        commit, conflicts = self._model_commit(store)
+        target = TARGET_LANG_NAME.get(self.language, self.language)
+        xlator.translate_jobs(
+            jobs, self.cfg["engine"], self.load_glossary(), self.load_relations(),
+            target, progress=progress, should_stop=should_stop, log=log,
+            retranslate_keys=store.retranslation_requested(),
+            seed=seed, commit=commit)
+        self._log_conflicts(log, sorted(set(conflicts)))
 
     # ---------- 各步骤 ----------
     def unpack(self, log, progress=None, should_stop=None):
@@ -267,13 +286,8 @@ class Project:
         if done0:
             log("断点续翻：已译 %d / %d 条，本次只翻译剩余 %d 条（已译内容不会重复请求）"
                 % (done0, len(jobs), len(jobs) - done0))
-        target = TARGET_LANG_NAME.get(self.language, self.language)
-        trans = xlator.translate_jobs(
-            jobs, self.cfg["engine"], self.load_glossary(), self.load_relations(),
-            trans_path, target,
-            progress=progress, should_stop=should_stop, log=log,
-            retranslate_keys=store.retranslation_requested())
-        self._record_results(log, store, seed, trans)
+        self._translate_into_store(log, store, jobs, seed,
+                                   progress=progress, should_stop=should_stop)
         dropped = []
         text_map, key_map = _expand_translations(jobs, store.currents(), dropped=dropped)
         n = tlgen.fill_translations(tl_files, text_map, key_map)
@@ -289,6 +303,7 @@ class Project:
                 log("    …其余 %d 条" % (len(dropped) - 3))
             log("    多出的变量名改对（或删掉）后重跑本步即可回填；译文记录保存在项目库中")
         log("⏱ 翻译总用时：%s" % _fmt_duration(time.monotonic() - t0))
+        # 派生镜像整份刷新（任务期间不再整份覆盖；pystrings 软去重等读取方沿用）
         write_json(trans_path, store.currents())
         return n, missing
 
@@ -308,12 +323,8 @@ class Project:
             return 0, 0
         log("未译 %d 条，本次只重译这些内容（已译内容不重复请求）" % len(missing))
         t0 = time.monotonic()
-        target = TARGET_LANG_NAME.get(self.language, self.language)
-        trans = xlator.translate_jobs(
-            missing, self.cfg["engine"], self.load_glossary(), self.load_relations(),
-            trans_path, target, progress=progress, should_stop=should_stop, log=log,
-            retranslate_keys=store.retranslation_requested())
-        self._record_results(log, store, seed, trans)
+        self._translate_into_store(log, store, missing, seed,
+                                   progress=progress, should_stop=should_stop)
         text_map, key_map = _expand_translations(jobs, store.currents())
         n = tlgen.fill_translations(tl_files, text_map, key_map)
         missing_after = sum(1 for j in jobs if j["old"]
@@ -322,6 +333,14 @@ class Project:
         log("⏱ 重译总用时：%s" % _fmt_duration(time.monotonic() - t0))
         write_json(trans_path, store.currents())
         return n, missing_after
+
+    @staticmethod
+    def _log_conflicts(log, conflicts):
+        """任务期间与人工确认译文冲突的结果：汇总成一条待检查说明。"""
+        if conflicts:
+            log("⚠ %d 条译文与人工定稿冲突（人工译文保持当前不动，本次结果已存为"
+                "候选译文、带冲突说明）：可在「④ 译文修改」比较后采用或忽略"
+                % len(conflicts))
 
     def fill_partial(self, log):
         """不调用 API：把项目库里的当前译文回填进 tl（未译行保持英文显示），

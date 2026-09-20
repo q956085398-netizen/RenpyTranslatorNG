@@ -13,6 +13,9 @@ core.util.store_dir）——项目包导出、迁移和删除都以项目为单�
   产生时的源文本与结构指纹快照。相同英文原文的不同出现位置各自持有译文记录。
 - **人工译文保护**（ADR-0003）：用户编辑或确认过的译文（confirmed）不可被翻译模型、
   重新提取或导入覆盖；自动过程的新结果只进入**候选译文**，采用必须经用户动作。
+- **项目任务**：tasks 表登记当前项目会改核心数据的后台任务（提取、翻译、迁移、
+  检查、应用），由 core.coordinator 项目任务协调器经同一连接入口读写——同一项目
+  同一时间至多一个此类任务；翻译任务按记录事务逐批提交，不再整份覆盖派生镜像文件。
 
 写路径只有本模块；work/<项目身份>/translations.json 是旧版整份缓存文件，仅在新
 项目库首次启用时一次性导入（import_currents 只补空位），此后是派生的镜像文件。
@@ -63,6 +66,17 @@ CREATE INDEX IF NOT EXISTS idx_trans_occ ON translations(occurrence_id, status);
 -- 数据库层面的硬约束：一个出现位置同一时间至多一条当前译文
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trans_current
     ON translations(occurrence_id) WHERE status = 'current';
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,              -- 'extract' | 'translate' | 'check' | 'apply' | ...
+    state        TEXT NOT NULL,              -- 'running' | 'done' | 'failed' | 'stopped' | 'interrupted'
+    pid          INTEGER,                    -- 启动进程：崩溃后的陈旧任务按存活判定回收
+    started_at   REAL NOT NULL,
+    heartbeat_at REAL NOT NULL,
+    finished_at  REAL,
+    summary      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 """
 
 
@@ -104,9 +118,13 @@ class ProjectStore:
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         try:
+            # WAL：任务运行期间的浏览与非冲突编辑（读写并行）不被整库写锁挡住；
+            # busy_timeout 兜底任务批量提交与用户编辑同时落库的瞬间争用
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 10000")
             conn.executescript(_SCHEMA)
             if conn.execute("PRAGMA user_version").fetchone()[0] < _SCHEMA_VERSION:
                 conn.execute("PRAGMA user_version = %d" % _SCHEMA_VERSION)
@@ -315,32 +333,57 @@ class ProjectStore:
         - 当前译文未确认（模型/导入）：新结果成为当前译文，旧当前译文降为候选
           （版本保留）；文本相同则不产生新版本；
         - 两种情况都清除该出现位置的重译请求标记。
+        单条便捷入口：与批量入口同一保护、同一冲突语义。
         """
-        with self._conn() as conn:
-            self._apply_model_result(conn, oid, text)
+        return self.record_model_results({oid: text})
 
     def record_model_results(self, mapping):
-        """批量登记模型译文（一次事务），返回 {current: n, candidate: n, unchanged: n}。"""
-        counts = {"current": 0, "candidate": 0, "unchanged": 0}
+        """批量登记模型译文（一次事务）。
+
+        返回 {"current": n, "candidate": n, "unchanged": n, "conflicts": [标识]}。
+        conflicts 是人工确认的当前译文被任务结果命中的出现位置：人工译文保持
+        当前不动，任务结果进入候选译文等待用户比较采用——这就是项目任务运行
+        期间"冲突编辑"的落点，绝不两边覆盖、也绝不静默丢弃任何一边。"""
+        counts = {"current": 0, "candidate": 0, "unchanged": 0, "conflicts": []}
         with self._conn() as conn:
+            task = self._running_task(conn)
             for oid, text in mapping.items():
-                outcome = self._apply_model_result(conn, oid, text)
+                outcome = self._apply_model_result(conn, oid, text, task=task)
                 counts[outcome] += 1
+                if outcome == "candidate":
+                    counts["conflicts"].append(oid)
         return counts
 
-    def _apply_model_result(self, conn, oid, text):
+    @staticmethod
+    def _running_task(conn):
+        """进行中的项目任务行（无则 None）。用于给并发冲突的候选译文写说明。"""
+        return conn.execute(
+            "SELECT * FROM tasks WHERE state = 'running'"
+            " ORDER BY started_at DESC LIMIT 1").fetchone()
+
+    def _apply_model_result(self, conn, oid, text, task=None):
         cur = self._current_row(conn, oid)
         conn.execute("UPDATE occurrences SET retranslate_requested = 0"
                      " WHERE occurrence_id = ?", (oid,))
         if cur is not None and cur["text"] == text:
             return "unchanged"
         if cur is not None and cur["confirmed"]:
-            same = conn.execute("SELECT 1 FROM translations WHERE occurrence_id = ?"
-                                " AND status = ? AND text = ?",
-                                (oid, STATUS_CANDIDATE, text)).fetchone()
+            note = "人工译文保持不变，模型结果进入候选"
+            if task is not None:
+                note += ("（项目任务《%s》运行期间与人工编辑冲突，"
+                         "请比较后采用或忽略）" % task["kind"])
+            same = conn.execute(
+                "SELECT id FROM translations WHERE occurrence_id = ?"
+                " AND status = ? AND text = ?",
+                (oid, STATUS_CANDIDATE, text)).fetchone()
             if same is None:
                 self._insert_translation(conn, oid, text, STATUS_CANDIDATE, "model",
-                                         False, note="人工译文保持不变，模型结果进入候选")
+                                         False, note=note)
+            elif task is not None:
+                # 相同候选早已存在（此前某轮的结果）：补上本次任务的冲突说明，
+                # 保证"冲突进带说明的待检查项"不依赖候选恰好是首条
+                conn.execute("UPDATE translations SET note = ? WHERE id = ?",
+                             (note, same["id"]))
             return "candidate"
         if cur is not None:
             conn.execute("UPDATE translations SET status = ?, note = NULL,"

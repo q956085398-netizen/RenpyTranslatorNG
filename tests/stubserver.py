@@ -31,13 +31,21 @@ class StubTranslator(object):
     def translate_text(self, text):
         return self.table.get(text) or default_translate(text)
 
+    def _gate(self, n):
+        """逐请求钩子（回复前调用，n 为本请求序号，从 1 起）。
+
+        测试用子类覆盖它实现确定性时序控制：请求已计数但回复可以任意推迟
+        （挂起模拟进程中断窗口、等测试完成并发编辑后再放行等）。默认直通。"""
+
     def _handle_chat(self, payload):
         messages = payload.get("messages") or []
         content = messages[-1].get("content", "") if messages else ""
         items = json.loads(content)
         with self._lock:
             self.request_count += 1
+            n = self.request_count
             self.requests.append(items)
+        self._gate(n)
         out = []
         for it in items:
             if isinstance(it, dict) and it.get("i"):

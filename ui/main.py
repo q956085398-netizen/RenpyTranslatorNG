@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from core.config import Config
 from core.pipeline import Project
+from core import coordinator
 from core import fontpatch
 from core import library as gamelib
 from core import relations as rel
@@ -41,6 +42,18 @@ _HL_SPAN = '<span style="background:#6e5aef;color:#ffffff;">%s</span>'
 PROFILE_KEYS = ("base_url", "api_key", "model", "temperature", "presence_penalty",
                 "thinking", "concurrency", "batch_size", "context_lines", "timeout",
                 "max_retry", "max_tokens", "max_prompt_tokens", "system_prompt")
+
+
+def project_task(kind):
+    """标记一个会修改当前汉化项目核心数据的后台步骤（_op_*）。
+
+    被 _run 识别后先经项目任务协调器登记（core.coordinator：同一项目同一时间
+    只允许一个此类任务）才启动；kind 用于任务摘要与冲突说明。漏标新步骤比
+    漏登记更危险——统一在方法定义处显式声明。"""
+    def deco(fn):
+        fn._project_task_kind = kind
+        return fn
+    return deco
 
 
 def _hl(text, kw):
@@ -345,7 +358,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg = Config()
         self.worker = None
+        self._lib_worker = None
+        self._task_handle = None
         self._running_fn = None
+        self._lib_running_fn = None
         self._fetch_threads = []
         self._edit_groups = None
         self._edit_path = ""
@@ -1251,7 +1267,13 @@ class MainWindow(QMainWindow):
         proj, _action = self._resolve_project(base)
         return Project(self.cfg, base, proj["id"])
 
+    # 会修改当前汉化项目核心数据的后台步骤用 @project_task(kind) 显式标记
+    # （见模块头 project_task 定义），不再用方法名映射——改名/新增步骤漏登记
+    # 就是绕行直写路径。
+
     def _run(self, fn):
+        if getattr(fn, "__self__", None) is self.lib_page:
+            return self._run_lib(fn)
         if self.worker and self.worker.isRunning():
             QMessageBox.information(
                 self, "忙碌", "有任务正在运行（进度见窗口底部状态栏，详细日志在「① 流程」页），\n请等待完成后再操作。")
@@ -1267,25 +1289,62 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "项目登记失败", str(e))
                 return
-        self.worker = Worker(fn)
-        self.worker.sig_log.connect(self._on_log)
-        self.worker.sig_prog.connect(self._on_prog)
-        self.worker.sig_done.connect(self._on_done)
-        self.worker.sig_confirm.connect(self._on_confirm)
-        # 日志与进度同步到状态栏：在其他页面（如④译文修改）发起任务也能看到反馈
-        self.worker.sig_log.connect(lambda m: self.statusBar().showMessage(str(m), 8000))
-        for b in self.steps + [self.btn_estimate, self.btn_scan, self.btn_fill,
-                               self.btn_retrans, self.btn_runall,
-                               self.btn_edit_apply, self.btn_edit_fix]:
-            b.setEnabled(False)
+            kind = getattr(fn, "_project_task_kind", None)
+            if kind:
+                # 同一汉化项目同一时间只允许一个修改核心数据的项目任务；
+                # 拒绝在界面层给出，而不是让两个任务同时写核心数据
+                try:
+                    self._task_handle = coordinator.TaskCoordinator(
+                        self._project().store()).begin(kind)
+                except coordinator.TaskBusy as e:
+                    QMessageBox.information(self, "任务进行中", str(e))
+                    return
+                except Exception as e:
+                    QMessageBox.warning(self, "任务登记失败", str(e))
+                    return
+        try:
+            self.worker = Worker(fn)
+            self.worker.sig_log.connect(self._on_log)
+            self.worker.sig_prog.connect(self._on_prog)
+            self.worker.sig_done.connect(self._on_done)
+            self.worker.sig_confirm.connect(self._on_confirm)
+            # 日志与进度同步到状态栏：在其他页面（如④译文修改）发起任务也能看到反馈
+            self.worker.sig_log.connect(lambda m: self.statusBar().showMessage(str(m), 8000))
+            for b in self.steps + [self.btn_estimate, self.btn_scan, self.btn_fill,
+                                   self.btn_retrans, self.btn_runall,
+                                   self.btn_edit_apply, self.btn_edit_fix]:
+                b.setEnabled(False)
+            self.btn_pause.setEnabled(True)
+            self.btn_pause.setText("⏸ 暂停")
+            self._side_state("busy", "任务运行中")
+            self._running_fn = fn
+            self.statusBar().showMessage("任务开始…", 0)
+            self.worker.start()
+        except BaseException:
+            # 启动失败时任务行必须收尾，否则它带着新鲜心跳阻塞本项目直到进程退出
+            task, self._task_handle = self._task_handle, None
+            if task is not None:
+                task.finish("failed", "任务启动失败")
+            raise
+
+    def _run_lib(self, fn):
+        """游戏库自己的任务（扫描/刷新）走独立槽位：不占项目任务的 Worker，
+        也不经项目任务协调器（游戏库记录不是汉化项目的项目资产），与运行中的
+        项目任务互不阻塞。"""
+        if self._lib_worker and self._lib_worker.isRunning():
+            QMessageBox.information(
+                self, "忙碌", "游戏库任务正在运行，请等待完成后再操作。")
+            return
+        self._lib_worker = Worker(fn)
+        self._lib_worker.sig_log.connect(self._on_log)
+        self._lib_worker.sig_prog.connect(self._on_prog)
+        self._lib_worker.sig_done.connect(self._on_done)
+        self._lib_worker.sig_log.connect(lambda m: self.statusBar().showMessage(str(m), 8000))
         self.lib_page.set_busy(True)
         self.lib_page.pause_update_check(True)   # 版本检查让路：不抢网络、不抢写库
-        self.btn_pause.setEnabled(True)
-        self.btn_pause.setText("⏸ 暂停")
-        self._side_state("busy", "任务运行中")
-        self._running_fn = fn
-        self.statusBar().showMessage("任务开始…", 0)
-        self.worker.start()
+        self._lib_running_fn = fn
+        self.statusBar().showMessage("游戏库任务开始…", 0)
+        self._lib_worker.start()
 
     def _on_log(self, msg):
         self.log.appendPlainText(str(msg))
@@ -1329,18 +1388,20 @@ class MainWindow(QMainWindow):
         self.worker.answer_confirm(res)
 
     def _on_done(self, ok, msg):
+        if self.sender() is self._lib_worker and self._lib_worker is not None:
+            return self._on_lib_done(ok, msg)
+        # 项目任务收尾：协调器登记的任务行落到终态（摘要给任务历史/诊断用）
+        paused = bool(self.worker and self.worker._stop)
+        task, self._task_handle = self._task_handle, None
+        if task is not None:
+            task.finish("done" if ok and not paused
+                        else ("stopped" if ok else "failed"), str(msg))
         for b in self.steps + [self.btn_estimate, self.btn_scan, self.btn_fill,
                                self.btn_retrans, self.btn_runall,
                                self.btn_edit_apply, self.btn_edit_fix]:
             b.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸ 暂停")
-        self.lib_page.set_busy(False)
-        # 游戏库自己的任务（扫描/刷新）结束后重建卡片墙
-        if getattr(self._running_fn, "__self__", None) is self.lib_page:
-            self.lib_page.reload()
-        self.lib_page.pause_update_check(False)  # 版本检查接着上次继续
-        paused = bool(self.worker and self.worker._stop)
         if not ok:
             self.lb_prog.setText("❌ 出错")
             self.statusBar().showMessage("❌ 出错：%s" % msg[:120], 10000)
@@ -1360,6 +1421,19 @@ class MainWindow(QMainWindow):
                 self._edit_reload()
             except Exception:
                 pass
+
+    def _on_lib_done(self, ok, msg):
+        """游戏库任务收尾：与项目任务互不影响，各自恢复各自的界面状态。"""
+        self.lib_page.set_busy(False)
+        self.lib_page.pause_update_check(False)  # 版本检查接着上次继续
+        # 游戏库自己的任务（扫描/刷新）结束后重建卡片墙
+        if getattr(self._lib_running_fn, "__self__", None) is self.lib_page:
+            self.lib_page.reload()
+        if not ok:
+            self.statusBar().showMessage("❌ 出错：%s" % str(msg)[:120], 10000)
+            QMessageBox.warning(self, "任务失败", str(msg)[:800])
+        else:
+            self.statusBar().showMessage("✅ %s" % msg, 10000)
 
     def _pause_worker(self):
         if not (self.worker and self.worker.isRunning()):
@@ -1395,6 +1469,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
             return
+        # 清空译文记录会改核心数据：与运行中的项目任务互斥（前台动作，不登记）
+        if coordinator.TaskCoordinator(p.store()).is_busy():
+            self._toast("有项目任务正在运行，请等它结束后再清空译文缓存")
+            return
         store = p.store()
         has_cache = bool(store.currents()) or os.path.isfile(
             os.path.join(p.work, "translations.json"))
@@ -1422,6 +1500,7 @@ class MainWindow(QMainWindow):
         else:
             self._toast("译文缓存已清空（备份为 translations.json.bak），重跑第5步即全文重译")
 
+    @project_task("全流程")
     def _op_all(self, log, prog, stop, confirm=None):
         p = self._project()
         log("① 解包：%s" % p.unpack(log, None, stop))
@@ -1469,16 +1548,20 @@ class MainWindow(QMainWindow):
             return "已暂停：已译部分已回填 tl，可先试玩；继续翻译请再执行第 5 步（自动续翻）"
         return "全流程完成"
 
+    @project_task("准备")
     def _op_unpack(self, log, prog, stop, confirm=None):
         return self._project().unpack(log, prog, stop)
 
+    @project_task("准备")
     def _op_decompile(self, log, prog, stop, confirm=None):
         return self._project().decompile(log, stop)
 
+    @project_task("提取")
     def _op_extract(self, log, prog, stop, confirm=None):
         n = self._project().extract_tl(log, stop)
         return "提取完成：%d 个对白块" % n
 
+    @project_task("检查")
     def _op_scan(self, log, prog, stop, confirm=None):
         p = self._project()
         chars = p.scan_relations(log, stop)
@@ -1486,20 +1569,24 @@ class MainWindow(QMainWindow):
         self._word_load()
         return "关系草表生成完成：%d 个角色，请审核" % len(chars)
 
+    @project_task("翻译")
     def _op_translate(self, log, prog, stop, confirm=None):
         n, missing = self._project().translate(log, prog, stop)
         return "回填 %d 条，未译 %d 条" % (n, missing)
 
+    @project_task("回填")
     def _op_fill(self, log, prog, stop, confirm=None):
         n, missing = self._project().fill_partial(log)
         return "已回填 %d 条译文（未译 %d 条显示英文），可以试玩了" % (n, missing)
 
+    @project_task("翻译")
     def _op_retrans(self, log, prog, stop, confirm=None):
         n, missing = self._project().retranslate_missing(log, prog, stop)
         if n == 0 and missing == 0:
             return "没有未译内容，无需重译"
         return "重译并回填 %d 条，剩余未译 %d 条" % (n, missing)
 
+    @project_task("修复")
     def _op_repair(self, log, prog, stop, confirm=None):
         n = self._project().repair_cache(log)
         if n:
@@ -1509,6 +1596,7 @@ class MainWindow(QMainWindow):
             "直接点「⤵ 应用修改到游戏」重新回填即可修复，不需要重新翻译。")
         return "缓存无需修复；游戏内乱码请点「应用修改到游戏」重新回填"
 
+    @project_task("应用")
     def _op_finish(self, log, prog, stop, confirm=None):
         p = self._project()
         p.apply_font(log)
@@ -1516,10 +1604,12 @@ class MainWindow(QMainWindow):
         p.apply_names(log)
         return "字体、语言入口、人名映射、输入助手已应用"
 
+    @project_task("应用")
     def _op_font_only(self, log, prog, stop, confirm=None):
         self._project().apply_font(log)
         return "字体已应用（无需重新翻译）"
 
+    @project_task("统计")
     def _op_estimate(self, log, prog, stop, confirm=None):
         est = self._project().estimate(log)
         msg = "共 %d 行 / 已译 %d / 待译 %d（约 %d 字符）" % (

@@ -12,7 +12,7 @@
 | 03 | 项目注册库与稳定项目身份 | resolved | 01 |
 | 04 | 旧数据自动迁移 | ready-for-agent | 03 |
 | 05 | 项目数据库:出现位置与译文记录 | resolved | 02, 03 |
-| 06 | 单项目单写入任务协调器 | ready-for-agent | 05 |
+| 06 | 单项目单写入任务协调器 | resolved | 05 |
 | 07 | 事务式应用与恢复 | ready-for-agent | 05, 06 |
 | 08 | 外部 tl 变更检测 | ready-for-agent | 07 |
 | 09 | 译文编辑页接入项目库 | ready-for-agent | 05, 06 |
@@ -49,3 +49,10 @@
   strings 语义)、人工译文不被模型/清缓存/补丁失效覆盖、重译请求按 key 生效、
   旧 translations.json 一次性导入;28 项存储测试 + 2 项菜单 key 测试 + e2e
   工单 05 段;答案见 `issues/05-….md` 的 Answer。06 现在解锁,07/09 只等 05(已解)。
+- 2026-09-20:06 已解决(单项目单写入任务协调器):core/coordinator.py 项目任务
+  协调器(项目库 tasks 表 + BEGIN IMMEDIATE 原子登记 + 心跳/进程死活判定的陈旧
+  接管,跨线程跨进程互斥)、翻译按记录事务逐批提交(translate_jobs 改 seed+commit,
+  删除整份覆盖镜像文件;真实 TerminateProcess 中断回归:已提交批次一致、无半写、
+  断点续跑不重发)、冲突编辑进带说明的候选译文(adopt_candidate 即任务后合并
+  入口)、游戏库任务独立 Worker 槽位不被项目任务锁住;13 项协调器测试 + e2e
+  工单 06 段;答案见 `issues/06-….md` 的 Answer。07 与 09 现在可并行,08 等 07。

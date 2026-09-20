@@ -10,6 +10,9 @@ stub 服务连接翻译（本地 HTTP，零费用零网络）→ 回填 → 再�
 （转义/标签/插值）、字符串字面量说话人、ipatch 各种覆盖形式、多主角与玩家
 自填关系词、引擎 common 字符串（含 developer 文件过滤）。
 
+工单 06 补充：项目任务协调器（同项目互斥、他项目无锁、任务行收尾）与翻译
+运行时的并发编辑（人工编辑与模型结果两边都不丢，冲突进带说明的候选译文）。
+
 测试全程使用临时目录（app_dir 重定向：注册库与项目资产目录都落在临时目录），不触碰真实 work/ 数据。
 """
 import json
@@ -18,11 +21,12 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from core import extract, ipatch, pipeline, project_store, registry, tlgen, util  # noqa: E402
+from core import coordinator, extract, ipatch, pipeline, project_store, registry, tlgen, util  # noqa: E402
 from tests import syntheng, stubserver  # noqa: E402
 
 failures = []
@@ -81,6 +85,11 @@ def jobs_by_key(game, dump_path):
     jobs, _files = tlgen.build_jobs(game, "chinese", dump, include_strings=True,
                                    context_lines=2)
     return {j["key"]: j for j in jobs}
+
+
+def batch6(items):
+    """stub 请求条目里的任务 key 列表（工单 06 并发窗口断言用）。"""
+    return [it["i"] for it in items if isinstance(it, dict) and it.get("i")]
 
 
 def tl_dir_of(game):
@@ -555,6 +564,102 @@ try:
 except Exception as e:  # noqa: BLE001 —— 任何环节失败都要记录而不是中断其余断言输出
     import traceback
     check("工单 05 项目库回归无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
+# 工单 06：单项目单写入任务协调器 —— 登记互斥、他项目无锁、并发编辑不丢
+# =====================================================================
+try:
+    game6 = os.path.join(TMP, "games", "synth_basic_coord")
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game6)
+    p6 = make_project(make_cfg(stub.base_url, ""), game6, "synth_basic_coord")
+    p6.extract_tl(log=lambda m: None)
+    coord6 = coordinator.TaskCoordinator(p6.store())
+
+    with coord6.begin("翻译"):
+        try:
+            coord6.begin("提取")
+            check("同一项目第二个核心数据任务被拒绝", False, "登记竟然成功")
+        except coordinator.TaskBusy:
+            check("同一项目第二个核心数据任务被拒绝", True)
+        # 其他汉化项目是独立项目库：本项目任务运行期间照常登记与收尾
+        game6b = os.path.join(TMP, "games", "synth_basic_coord_b")
+        shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game6b)
+        p6b = make_project(make_cfg(stub.base_url, ""), game6b, "synth_basic_coord_b")
+        p6b.extract_tl(log=lambda m: None)
+        with coordinator.TaskCoordinator(p6b.store()).begin("翻译"):
+            pass
+        check("另一项目在本项目任务运行期间照常登记任务",
+              coordinator.TaskCoordinator(p6b.store()).history()[0]["state"] == "done")
+
+    with coord6.begin("翻译"):
+        p6.translate(log=lambda m: None)
+    hist6 = coord6.history()
+    check("翻译任务经协调器登记并正常收尾（带任务摘要）",
+          hist6[0]["kind"] == "翻译" and hist6[0]["state"] == "done", hist6[0])
+
+    # ---------- 翻译运行时的并发编辑：两边数据都不丢失 ----------
+    class _Gated(stubserver.StubTranslator):
+        """第 2 个请求挂起直到放行：制造确定性的并发编辑窗口。"""
+
+        def __init__(self, table=None):
+            super().__init__(table)
+            self.gate = threading.Event()
+            self.reached = threading.Event()
+
+        def _gate(self, n):
+            if n >= 2:
+                self.reached.set()
+                self.gate.wait(timeout=120)
+
+    stub6 = _Gated().start()
+    try:
+        game6c = os.path.join(TMP, "games", "synth_basic_coord_edit")
+        shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game6c)
+        cfg6c = make_cfg(stub6.base_url, "")
+        cfg6c["engine"]["concurrency"] = 1   # 批次串行：第 2 批请求到达 ⇒ 第 1 批已提交
+        p6c = make_project(cfg6c, game6c, "synth_basic_coord_edit")
+        p6c.extract_tl(log=lambda m: None)
+        coord6c = coordinator.TaskCoordinator(p6c.store())
+        err6 = []
+
+        def _translate6():
+            try:
+                with coord6c.begin("翻译"):
+                    p6c.translate(log=lambda m: None)
+            except Exception as e:  # noqa: BLE001
+                err6.append(e)
+
+        th6 = threading.Thread(target=_translate6)
+        th6.start()
+        check("并发窗口到达（第 2 批在途，第 1 批已提交）", stub6.reached.wait(60))
+        store6c = p6c.store()
+        first6 = batch6(stub6.requests[0])
+        later6 = batch6(stub6.requests[1])
+        _missing6 = [k for k in first6 if store6c.get_current(k) is None]
+        check("前一批请求已按记录事务提交（第 1 批当前译文在库）",
+              not _missing6, "first=%s missing=%s" % (first6, _missing6))
+        conflict6 = later6[0]      # 任务即将翻译的记录：与其冲突
+        store6c.set_human_translation(conflict6, "任务期间的人工编辑。")
+        stub6.gate.set()
+        th6.join(120)
+        check("翻译任务并发回归无异常", not err6 and not th6.is_alive(), repr(err6))
+        cur6 = store6c.get_current(conflict6)
+        check("任务运行期间的人工编辑保持为当前译文",
+              cur6 is not None and cur6["text"] == "任务期间的人工编辑。" and cur6["confirmed"])
+        cand6 = [c for c in store6c.candidates(conflict6) if c["text"] != cur6["text"]]
+        check("任务结果与人工编辑冲突时进入带说明的候选译文（任务结束后可比较采用）",
+              len(cand6) == 1 and "冲突" in (cand6[0]["note"] or ""),
+              cand6 and cand6[0]["note"])
+        st6c = store6c.stats()
+        check("并发编辑与翻译结果合并不丢失（全部出现位置都有当前译文）",
+              st6c["currents"] == st6c["occurrences"], st6c)
+        check("并发翻译任务经协调器正常收尾", coord6c.history()[0]["state"] == "done")
+    finally:
+        stub6.stop()
+except Exception as e:  # noqa: BLE001
+    import traceback
+    check("工单 06 协调器回归无异常", False, "%s: %s" % (type(e).__name__, e))
     traceback.print_exc()
 
 # =====================================================================

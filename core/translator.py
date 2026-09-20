@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from . import texttags
-from .util import read_json, write_json
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$")
 
@@ -370,16 +369,34 @@ def build_system_prompt(target_lang, glossary_hits, relation_hits, names_line=""
     return "\n".join(lines)
 
 
-def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="简体中文",
-                   progress=None, should_stop=None, log=print, retranslate_keys=None):
-    """翻译 jobs（build_jobs 的输出）。增量保存到 work_path，返回 translations 字典。
+def translate_jobs(jobs, engine, glossary, relations, target_lang="简体中文",
+                   progress=None, should_stop=None, log=print, retranslate_keys=None,
+                   seed=None, commit=None):
+    """翻译 jobs（build_jobs 的输出），返回本任务内存中的 translations 字典。
+
+    seed：断点续翻与同文去重的种子译文（调用方从项目库取，通常是全部当前译文
+    去掉已请求重译的出现位置）；不再从派生镜像文件读取。
+    commit：按记录事务提交的入口（映射 {任务 key: 译文}），每个批次的结果在
+    解析、标签修复、变量还原之后立即提交一次（项目库一次一小事务）——进程中断
+    时已提交批次完整一致，未提交批次不产生半写状态，不再有"整份覆盖派生镜像"
+    的最后写入者覆盖窗口。commit 为 None 时只保留内存结果（轻量调用方用）。
 
     retranslate_keys：要求重新翻译的任务 key（用户对具体译文发起的重译请求）。
     这些 key 不吃同文去重缓存——即使同原文的其它 key 已有译文也要单独请求，
     请求结果由调用方决定去向（人工确认的译文只进候选）。"""
-    translations = read_json(work_path, {}) or {}
+    translations = dict(seed or {})
     lock = threading.Lock()
     retrans = set(retranslate_keys or ())
+
+    def commit_results(fixed):
+        """把一批已修复的模型结果交给提交入口（调用方负责事务与冲突处理）。
+
+        按记录事务提交：每批立即落库（项目库一次一小事务），进程中断时已提交
+        批次保持一致、未提交批次不产生半写状态。旧实现每 20 条/15 秒整份重写
+        派生镜像文件——写盘时持锁把并发压成事实上的 1，且最后一次整份写入与
+        内存状态之间没有一致边界。"""
+        if fixed and commit is not None:
+            commit(fixed)
 
     # 相同文本去重：一次翻译，多处复用（同句同译，天然保证一致性）
     # 断点续翻：同一文本的任意 key 已有译文即视为已译（即使上次中途退出没来得及展开）
@@ -388,6 +405,7 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
         if j["old"]:
             text_map.setdefault(j["old"], []).append(j["key"])
     dedup = {}
+    reused = {}
     for text, keys in text_map.items():
         done = None
         for k in keys:
@@ -406,13 +424,17 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
             break
         if done:
             for k in keys:
-                if k not in retrans:
-                    translations.setdefault(k, done)
+                if k not in retrans and k not in translations:
+                    translations[k] = done
+                    reused[k] = done
         else:
             dedup[keys[0]] = text
         for k in keys:
             if k in retrans:
                 dedup[k] = text
+    # 同文复用的种子展开也是一条模型结果：按记录事务提交（k 在 seed 里已有
+    # 译文的自然跳过），进程中断后断点续翻才不会把这些 key 当作未译重发请求
+    commit_results(reused)
 
     todo_keys = list(dedup.keys())
     who_ctx = {j["key"]: (j.get("who", ""), j.get("ctx") or ([], [])) for j in jobs}
@@ -429,20 +451,9 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
     except (TypeError, ValueError):
         prompt_budget = 0
 
-    # 落盘节流：整份缓存重写一次的开销随已译条数线性增长（6 万条时约 6 MB），
-    # 每批都写既拖慢长任务，又因写盘时持锁把并发压成事实上的 1
-    save_state = {"t": time.monotonic(), "dirty": 0}
     fail_streak = [0]   # 连续整批失败的次数（熔断用）
     interp_bad = [0]    # 译文里出现原文没有的 [变量] 的条数（回填时会被拒用）
     aborted = [None]    # 熔断原因；置位后所有工作线程尽快退出
-
-    def checkpoint(force=False):
-        """把译文缓存落盘。调用方需持有 lock。"""
-        save_state["dirty"] += 1
-        if force or save_state["dirty"] >= 20 or time.monotonic() - save_state["t"] >= 15:
-            write_json(work_path, translations)
-            save_state["dirty"] = 0
-            save_state["t"] = time.monotonic()
 
     def split_and_retry(batch, attempt, depth, why):
         """把批次一分为二重试（输入超预算 / 超出模型上下文 / 回复被截断时用）。
@@ -487,21 +498,25 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
             reply, finish = chat_raw(engine, [{"role": "system", "content": sys_prompt},
                                               {"role": "user", "content": user_content}])
             got = _align_results(_parse_json_array(reply), batch)
+            # 入库前先按原文还原 [变量]（模型偶尔会把 [PlayerName] 改名成
+            # [player_name] 或整个翻译掉）；还原不了的照存，回填时会被拒用。
+            # 先提交（记录事务）、再并入内存：提交失败走批次重试，不会出现在
+            # "内存已记、库里没有"的半提交状态。
+            fixed = {}
+            for k, t in got.items():
+                t, bad_interp = texttags.fix_interps(dedup.get(k, ""), t)
+                if bad_interp:
+                    interp_bad[0] += 1
+                    if interp_bad[0] <= 10:
+                        log("⚠ 译文出现原文没有的 [变量] %s（%s）——回填时会拒用这条"
+                            % (bad_interp, k))
+                fixed[k] = t
+            commit_results(fixed)
             with lock:
-                for k, t in got.items():
-                    # 模型偶尔会把 [变量] 改名（[PlayerName] → [player_name]）或整个
-                    # 翻译掉，入库前先按原文还原；还原不了的照存，回填时会被拒用
-                    t, bad_interp = texttags.fix_interps(dedup.get(k, ""), t)
-                    if bad_interp:
-                        interp_bad[0] += 1
-                        if interp_bad[0] <= 10:
-                            log("⚠ 译文出现原文没有的 [变量] %s（%s）——回填时会拒用这条"
-                                % (bad_interp, k))
-                    translations[k] = t
-                done_all += len(got)
-                if got:
+                translations.update(fixed)
+                done_all += len(fixed)
+                if fixed:
                     fail_streak[0] = 0
-                    checkpoint()
             if progress:
                 progress(min(done_all, total_all), total_all)
             missing = [k for k in batch if k not in got]
@@ -546,14 +561,18 @@ def translate_jobs(jobs, engine, glossary, relations, work_path, target_lang="�
         # 已有自己译文的 key 绝不覆盖——否则「同一句英文在不同分支的既有译法」和
         # 被人工排除补丁（ipatch_skip.json）的条目会被一起抹平成同一条译文。
         # 请求重译的 key 不参与复用：要么拿到自己的新结果，要么留给下一轮重试。
-        # 放在 finally 里，熔断中止时也要把已完成的部分存下来（断点续翻靠它）
+        # 放在 finally 里，熔断中止时也要把已完成的部分提交（断点续翻靠它）；
+        # 展开结果同样走记录事务提交（经人工译文保护入口，冲突只进候选）。
+        expanded = {}
         for text, keys in text_map.items():
             t = next((translations[k] for k in keys if translations.get(k)), None)
-            if t:
-                for k in keys:
-                    if k not in retrans:
-                        translations.setdefault(k, t)
-        write_json(work_path, translations)
+            if not t:
+                continue
+            for k in keys:
+                if k not in retrans and not translations.get(k):
+                    translations[k] = t
+                    expanded[k] = t
+        commit_results(expanded)
     if interp_bad[0]:
         log("⚠ 本次有 %d 条译文的 [变量] 与原文对不上，回填时会被拒用（这些行先显示英文）；"
             "多为模型把变量改名，重跑一次通常就好" % interp_bad[0])
