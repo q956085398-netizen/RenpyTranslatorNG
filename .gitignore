@@ -23,3 +23,6 @@ build/
 # pytest 缓存与本机私有回归样本清单（真实游戏路径，绝不入库）
 .pytest_cache/
 tests/private_regression_cases.json
+
+# 本机快捷方式（指向本机 Python 安装的启动入口，各机器自行创建）
+RenpyTranslatorNG.lnk
