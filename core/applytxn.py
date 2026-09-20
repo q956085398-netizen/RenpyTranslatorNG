@@ -312,7 +312,7 @@ def _rollback_entries(game_base, rp_dir, entries, log):
 
 def run(game_base, work, language, cfg, text_map, key_map, keep_files,
         fill_files=None, relations=(), relation_words=(), dump=None,
-        untranslated=0, dropped=0, suggestions=0,
+        untranslated=0, dropped=0, suggestions=0, external=None,
         log=None, should_stop=None):
     """执行一次事务式应用,返回可验证的任务摘要(工单 07)。
 
@@ -321,6 +321,8 @@ def run(game_base, work, language, cfg, text_map, key_map, keep_files,
     keep_files 是统一应用管理的 tl 文件集(相对 tl/<语言> 的路径,build_jobs
     识别的当前任务清单——不在其中的 tl 文件按旧文件移除);fill_files 是其中
     要回填的子集(translate_strings 关闭时纯 strings 文件只通过不回填)。
+    external 是外部译文变更的处理计数(工单 08,pipeline 传入),写进应用清单
+    留痕:放弃的覆盖、导入的已并进译文映射。
     """
     log = log or _noop
     game_tl = os.path.join(game_base, "game", "tl", language)
@@ -428,10 +430,14 @@ def run(game_base, work, language, cfg, text_map, key_map, keep_files,
     counts = {}
     for e in entries:
         counts[e["owner"]] = counts.get(e["owner"], 0) + 1
+    external_full = dict(external or {"detected": 0, "imported": 0, "discarded": 0})
+    external_full.setdefault("items", [])
     summary = {"apply_id": apply_id, "filled": filled, "untranslated": untranslated,
                "dropped": dropped, "suggestions": suggestions,
                "files_total": len(entries), "files": counts,
-               "fonts_replaced": len(font_refs), "restore_point": rp_dir}
+               "fonts_replaced": len(font_refs), "restore_point": rp_dir,
+               "external": {k: external_full[k] for k in
+                           ("detected", "imported", "discarded")}}
     manifest = {
         "apply_id": apply_id, "applied_at": time.time(), "language": language,
         "game_base": game_base, "project_files_note":
@@ -440,6 +446,8 @@ def run(game_base, work, language, cfg, text_map, key_map, keep_files,
                    "before": e.get("before"), "after": e.get("after")} for e in entries],
         "summary": {k: summary[k] for k in
                     ("filled", "untranslated", "files", "fonts_replaced")},
+        # 外部译文变更的逐项处理留痕(工单 08):哪些被导入、哪些被明确放弃
+        "external_changes": external_full,
         "font_backup_kept": "game/fonts_ng_backup",
     }
     util.write_json(os.path.join(rp_dir, MANIFEST_NAME), manifest)

@@ -140,6 +140,49 @@ def build_jobs(game_base, language, dump, include_strings=True, context_lines=2)
     return jobs, tl_files
 
 
+def scan_translations(path):
+    """读出一份 tl 文件当前实际生效的译文：{出现位置标识: {"text", "anchor"}}。
+
+    与 fill_translations 严格同一套块结构与位置配对规则（同一注释/代码行配对、
+    同一说话人名字判定），保证"工具写入的"与"检测读到的"按同一规则对齐——
+    外部 tl 变更检测（core.externaltl，工单 08）据此与应用基线对账。
+    anchor 是注释行里的原文锚点（strings 块为 old 文本），用于识别外部结构
+    改动造成的配对错位；strings 块未译的空 new 行 text 为空串。
+    """
+    tf = TlFile(path)
+    out = {}
+    for (lang, bid), body in _iter_blocks(tf.lines):
+        lives = _live_body(tf.lines, body)
+        if bid == "strings":
+            pending = None
+            for k in lives:
+                s = tf.lines[k].strip()
+                if s.startswith("old "):
+                    m = _STR.search(s)
+                    pending = unesc_rpy(m.group(1)) if m else None
+                elif s.startswith("new ") and pending is not None:
+                    m = _STR.search(s)
+                    out["S:" + pending] = {"text": unesc_rpy(m.group(1)) if m else "",
+                                           "anchor": pending}
+                    pending = None
+            continue
+        comments = [tf.lines[k].strip() for k in body
+                    if tf.lines[k].strip().startswith("#")]
+        for i, (c, k) in enumerate(zip(comments, lives)):
+            cs, ks = _STR.findall(c), _STR.findall(tf.lines[k])
+            if not cs:
+                continue
+            # 字符串字面量说话人（"Guard 1" "台词"）：注释与代码行的第 1 个串
+            # 都是说话人名字时，锚点与译文都取第 2 个串（与回填一致）
+            n = 1 if (len(cs) > 1 and len(ks) > 1 and unesc_rpy(cs[0]) == unesc_rpy(ks[0])) else 0
+            if n >= len(cs):
+                n = 0
+            key = bid if i == 0 else "%s:s%d" % (bid, i)
+            out[key] = {"text": unesc_rpy(ks[n]) if n < len(ks) else None,
+                        "anchor": unesc_rpy(cs[n])}
+    return out
+
+
 def fill_translations(tl_files, text_map, key_map=None):
     """回填 tl 文件，返回替换条数。
 

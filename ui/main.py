@@ -530,6 +530,130 @@ class ApplyPointsDialog(QDialog):
         self.main._run(self.main._op_deactivate)
 
 
+class ExternalChangesDialog(QDialog):
+    """外部译文变更处理（工单 08、ADR-0005）：应用前逐项比较、导入或明确放弃。
+
+    导入 = 外部译文登记为人工来源的当前译文（受人工译文保护）；
+    放弃 = 明确允许本次应用覆盖（应用清单留痕）；
+    取消 = 中止应用，游戏目录保持现状。存在未逐项处理的变更时不能继续。
+    """
+
+    KIND_LABELS = {"modified": "改写译文", "added": "补了译文", "removed": "删了译文行",
+                   "unmanaged": "不在任务清单的位置", "removed_file": "删了整个文件",
+                   "untracked": "工具未管理的新文件",
+                   "structure": "行结构被改动（位置配对不可靠）"}
+
+    def __init__(self, payload, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("检测到外部译文变更")
+        self.resize(1020, 640)
+        self.items = payload.get("items") or []
+
+        lv = QVBoxLayout(self)
+        hint = QLabel("游戏 tl 文件在汉化工作台之外被修改（外部译文变更）。"
+                      "勾选「导入」的条目会登记为人工来源的当前译文（受人工译文保护，"
+                      "模型重译只进候选）；不勾选即明确放弃，本次应用将覆盖它"
+                      "（应用清单留痕，可从恢复点找回）。取消则中止应用，游戏目录保持现状。")
+        hint.setWordWrap(True)
+        hint.setObjectName("dim")
+        lv.addWidget(hint)
+
+        self.tbl = QTableWidget(len(self.items), 6)
+        self.tbl.setHorizontalHeaderLabels(
+            ["导入", "文件（相对 tl 目录）", "原文", "工具译文（上次应用）",
+             "游戏目录（外部修改）", "变更"])
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.tbl.setColumnWidth(0, 46)
+        self.tbl.setColumnWidth(1, 170)
+        self.tbl.setColumnWidth(5, 120)
+        self._boxes = []
+        for r, it in enumerate(self.items):
+            box = QCheckBox()
+            box.setEnabled(bool(it.get("importable")))
+            if not it.get("importable"):
+                box.setToolTip("该变更没有可导入的译文（删除行/未管理位置/整文件），"
+                               "只能放弃（应用后按工具状态覆盖）或取消")
+            box.setChecked(bool(it.get("importable")))
+            self._boxes.append(box)
+            self.tbl.setCellWidget(r, 0, box)
+            kind = self.KIND_LABELS.get(it.get("kind"), it.get("kind"))
+            if it.get("note"):
+                kind = "⚠ " + kind
+            for col, val in ((1, it.get("file")), (2, it.get("anchor")),
+                             (3, it.get("baseline")), (4, it.get("current")),
+                             (5, kind)):
+                cell = QTableWidgetItem(val if isinstance(val, str) else
+                                        ("（不存在）" if col in (3, 4) else "—"))
+                tip = val if isinstance(val, str) else ""
+                if col == 5 and it.get("note"):
+                    tip = (tip + "\n" if tip else "") + it["note"]
+                cell.setToolTip(tip)
+                self.tbl.setItem(r, col, cell)
+        self.tbl.itemSelectionChanged.connect(self._show_diff)
+        lv.addWidget(self.tbl, 3)
+        self.diff = QPlainTextEdit()
+        self.diff.setReadOnly(True)
+        self.diff.setPlaceholderText("选中一个条目查看比较（工具译文 ←→ 游戏目录外部修改）")
+        lv.addWidget(self.diff, 2)
+
+        row = QHBoxLayout()
+        btn_all = QPushButton("全部导入")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none = QPushButton("全部放弃")
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        btn_go = QPushButton("继续应用")
+        btn_go.setObjectName("primary")
+        btn_go.clicked.connect(self.accept)
+        btn_cancel = QPushButton("取消（中止应用）")
+        btn_cancel.clicked.connect(self.reject)
+        for b in (btn_all, btn_none):
+            row.addWidget(b)
+        row.addStretch(1)
+        row.addWidget(btn_go)
+        row.addWidget(btn_cancel)
+        lv.addLayout(row)
+        if self.items:
+            self.tbl.selectRow(0)
+
+    def _set_all(self, on):
+        for box, it in zip(self._boxes, self.items):
+            box.setChecked(on and it.get("importable"))
+
+    def decisions(self):
+        """逐项处理结果：{"import": [条目 id…], "discard": [条目 id…]}。"""
+        imports = [it["id"] for box, it in zip(self._boxes, self.items)
+                   if box.isEnabled() and box.isChecked()]
+        return {"import": imports,
+                "discard": [it["id"] for it in self.items
+                            if it["id"] not in imports]}
+
+    def _show_diff(self):
+        self.diff.clear()
+        rows = self.tbl.selectionModel().selectedRows()
+        if not rows:
+            return
+        it = self.items[rows[0].row()]
+        parts = ["%s（%s）｜出现位置：%s" % (
+            it.get("file"), self.KIND_LABELS.get(it.get("kind"), it.get("kind")),
+            it.get("key") or "—")]
+        if it.get("kind") in ("removed_file", "untracked", "structure"):
+            parts.append(it.get("note") or "文件级变更，没有可逐条比较的译文。")
+            self.diff.setPlainText("\n".join(parts))
+            return
+        before = it.get("baseline")
+        after = it.get("current")
+        diff = list(difflib.unified_diff(
+            (before or "").splitlines(), (after or "").splitlines(),
+            fromfile="工具译文（上次应用）", tofile="游戏目录（外部修改）", lineterm=""))
+        parts.append("—— 差异（- 工具译文 / + 外部修改）——")
+        parts.append("\n".join(diff) if diff else "（两个版本内容相同）")
+        self.diff.setPlainText("\n".join(parts))
+
+
 class MainWindow(QMainWindow):
     sig_est = Signal(str)  # 工作线程里安全更新“统计工作量”标签
 
@@ -1647,7 +1771,19 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 0)
 
     def _on_confirm(self, message):
-        if message.startswith("RELATIONS:"):
+        if message.startswith("EXTTL:"):
+            # 外部译文变更（工单 08）：逐项比较后导入（人工来源）或明确放弃；
+            # 取消对话框 = 中止应用，游戏目录保持现状
+            try:
+                payload = json.loads(message.split(":", 1)[1])
+            except ValueError:
+                payload = {"items": []}
+            dlg = ExternalChangesDialog(payload, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                res = json.dumps(dlg.decisions(), ensure_ascii=False)
+            else:
+                res = "abort"
+        elif message.startswith("RELATIONS:"):
             try:
                 chars = json.loads(message.split(":", 1)[1])
             except ValueError:
@@ -1846,7 +1982,10 @@ class MainWindow(QMainWindow):
             if not use_relations and os.path.isfile(rel_bak):
                 os.replace(rel_bak, rel_path)
         paused = stop()
-        p.apply_txn(log)
+        s = p.apply_txn(log, confirm=confirm)
+        if s.get("stopped"):
+            return ("已在外部译文变更处理时中止：游戏目录未改动；"
+                    "处理完变更后请手动执行第 6 步应用")
         if paused:
             return "已暂停：已译部分已应用（可先试玩）；继续翻译请再执行第 5 步（自动续翻）"
         return "全流程完成"
@@ -1879,7 +2018,7 @@ class MainWindow(QMainWindow):
 
     @project_task("回填")
     def _op_fill(self, log, prog, stop, confirm=None):
-        s = self._project().apply_txn(log)
+        s = self._project().apply_txn(log, confirm=confirm)
         return apply_summary_msg(s)
 
     @project_task("翻译")
@@ -1901,14 +2040,14 @@ class MainWindow(QMainWindow):
 
     @project_task("应用")
     def _op_finish(self, log, prog, stop, confirm=None):
-        s = self._project().apply_txn(log)
+        s = self._project().apply_txn(log, confirm=confirm)
         return apply_summary_msg(s)
 
     @project_task("应用")
     def _op_deactivate(self, log, prog, stop, confirm=None):
         """停用汉化:只撤销工具管理的文件,汉化项目与全部资产保留。"""
         p = self._project()
-        s = applytxn.deactivate(p.work, p.game_base, p.cfg, p.language, log)
+        s = p.deactivate(log)
         return ("汉化已停用（撤销/清理 %d 个工具管理的文件）；译文与恢复点都在，"
                 "再次「应用到游戏」即恢复汉化" % s["files"])
 
@@ -1917,7 +2056,7 @@ class MainWindow(QMainWindow):
         @project_task("应用")
         def op(log, prog, stop, confirm=None):
             p = self._project()
-            s = applytxn.restore(p.work, p.game_base, apply_id, log)
+            s = p.restore_apply(apply_id, log)
             return "已还原到应用 %s 之前（%d 个文件；恢复点保留）" % (
                 apply_id, s["files"])
         return op

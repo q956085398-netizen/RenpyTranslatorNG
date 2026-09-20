@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """流程编排：解包 -> 反编译 -> 提取+tl骨架 -> 关系扫描 -> 翻译回填 -> 字体/语言入口。"""
+import json
 import os
 import shutil
 import time
 
-from . import applytxn, decompile, extract, fontpatch, ipatch, project_store, pystrings, relations, texttags, tlgen, uipatch
+from . import applytxn, decompile, extract, externaltl, fontpatch, ipatch, project_store, pystrings, relations, texttags, tlgen, uipatch
 from . import translator as xlator
 from . import unrpa
 from .util import fmt_exc, read_json, store_dir, write_json
@@ -350,16 +351,120 @@ class Project:
                 "候选译文、带冲突说明）：可在「④ 译文修改」比较后采用或忽略"
                 % len(conflicts))
 
-    def apply_txn(self, log, should_stop=None):
+    def _refresh_tl_baseline(self):
+        """应用基线刷新（工单 08）：应用成功/还原/停用后调用，同一落点不重复。"""
+        externaltl.refresh_baseline(self.work, self.game_base, self.language)
+
+    @staticmethod
+    def _import_reject_note(item, job):
+        """导入项的预防性说明：译文会危及运行时（含原文没有的 [变量]/{}）时，
+        导入能存进项目库，但本次应用仍会拒用该行（显示英文）——提前说清楚，
+        不让"选择导入 → 游戏显示英文"变成无解释的意外。"""
+        text = item.get("current") or ""
+        if not job or not text:
+            return None
+        t = xlator.fix_rpy_tags(text)
+        _t, bad = texttags.fix_interps(job["old"], t)
+        if bad or t.count("{}") != job["old"].count("{}"):
+            return ("译文含原文没有的 [变量] 或 {} 占位符（运行时必崩）：导入会存为"
+                    "人工译文，但本次应用仍会拒用该行、显示英文；改对后重新应用即可")
+        return None
+
+    def _draft_expected(self, jobs, store):
+        """无基线（从未应用）时的检测参照：翻译/回填步骤实际写进游戏 tl 的内容。
+
+        提取后的骨架是原文，第 5 步翻译会把项目库当前译文回填进游戏 tl——
+        这些都是工具自身的写入，不算外部译文变更；展开逻辑与回填一致
+        （含标签修复与占位符校验拒用后的原文回退）。
+        """
+        if externaltl.load_baseline(self.work) is not None:
+            return None
+        text_map, key_map = _expand_translations(jobs, store.currents())
+        out = {}
+        for j in jobs:
+            if not j.get("old"):
+                continue
+            anchor = j.get("orig") or j["old"]
+            out[j["key"]] = key_map.get(j["key"]) or text_map.get(anchor) or anchor
+        return out
+
+    def _resolve_external_changes(self, log, store, jobs, confirm):
+        """应用前处理外部译文变更（ADR-0005、工单 08），返回应用清单留痕用的
+        计数与逐项明细。
+
+        无变更不打扰；有变更而调用方没有确认通道则阻止应用（绝不静默覆盖）。
+        用户逐项选择后：导入 = set_human_translation 登记为人工来源的当前译文
+        （受人工译文保护），放弃 = 明确允许本次应用覆盖。全部变更项必须处理完
+        才能继续；返回 None 表示用户中止（游戏目录不动）。
+        """
+        report = externaltl.detect_changes(
+            self.game_base, self.work, self.language, jobs,
+            draft_expected=self._draft_expected(jobs, store))
+        items = report["items"]
+        ext = {"detected": len(items), "imported": 0, "discarded": 0, "items": []}
+        if not items:
+            return ext
+        log("检测到 %d 处外部译文变更（游戏 tl 文件在汉化工作台之外被修改），"
+            "等待逐项处理…" % len(items))
+        if confirm is None:
+            files = sorted({i["file"] for i in items})
+            raise externaltl.ExternalChangesError(
+                "检测到 %d 处外部译文变更（%s），应用已被阻止（外部修改绝不静默"
+                "覆盖）。请在界面上逐项比较后导入或放弃，再重新应用。"
+                % (len(items), "、".join(files[:5]) + ("…" if len(files) > 5 else "")),
+                items)
+        jobs_by_key = {j["key"]: j for j in jobs}
+        for i in items:
+            note = self._import_reject_note(i, jobs_by_key.get(i.get("key")))
+            if note:
+                i["note"] = note
+        answer = confirm("EXTTL:" + json.dumps({"items": items}, ensure_ascii=False))
+        if not answer or answer == "abort":
+            log("已中止应用：外部译文变更未处理，游戏目录保持现状。")
+            return None
+        try:
+            decisions = json.loads(answer)
+            to_import = [i for i in items
+                         if i["id"] in decisions.get("import", []) and i["importable"]]
+            to_discard = [i for i in items if i["id"] in decisions.get("discard", [])]
+        except ValueError:
+            to_import, to_discard = [], []
+        handled = {i["id"] for i in to_import + to_discard}
+        if len(handled) < len(items):
+            log("⚠ 有 %d 处外部变更未逐项处理，已中止应用（游戏目录未改动）。"
+                % (len(items) - len(handled)))
+            return None
+        for i in to_import:
+            store.set_human_translation(i["key"], i["current"])
+            ext["imported"] += 1
+            ext["items"].append({"key": i["key"], "file": i["file"],
+                                 "kind": i["kind"], "action": "imported"})
+        for i in to_discard:
+            ext["discarded"] += 1
+            ext["items"].append({"key": i["key"], "file": i["file"],
+                                 "kind": i["kind"], "action": "discarded"})
+        if ext["imported"]:
+            log("已导入外部译文 %d 条：登记为人工来源的当前译文（受人工译文保护，"
+                "模型重译只会进入候选译文）。" % ext["imported"])
+        if ext["discarded"]:
+            log("已按你的选择放弃 %d 处外部变更：本次应用将覆盖这些修改"
+                "（应用清单逐项留痕，替换前字节在恢复点里）。" % ext["discarded"])
+        return ext
+
+    def apply_txn(self, log, should_stop=None, confirm=None):
         """「应用到游戏」:事务式统一应用(core.applytxn,工单 07)。
 
         暂存生成(回填 tl + 人名与关系词显示层 + 字体 + 语言入口)→ 快速结构
         检查 → 统一替换 → 应用清单/恢复点;任何阶段失败游戏目录保持应用前
         状态。出现位置同步与旧缓存导入都在本应用任务内完成(译文映射取自
-        项目库当前译文)。
+        项目库当前译文)。应用前先检测外部译文变更并逐项处理(工单 08):
+        导入(人工来源)/放弃(清单留痕)/中止;成功后基线自动更新。
         """
         jobs, tl_files = self._jobs(log)
         store = self._import_legacy_cache(log)
+        ext = self._resolve_external_changes(log, store, jobs, confirm)
+        if ext is None:
+            return {"stopped": True}
         dropped = []
         text_map, key_map = _expand_translations(jobs, store.currents(), dropped=dropped)
         missing = sum(1 for j in jobs if j["old"]
@@ -376,11 +481,27 @@ class Project:
             relation_words=self.load_relation_words(), dump=dump,
             untranslated=missing, dropped=len(dropped),
             suggestions=store.stats()["suggestions"],
-            log=log, should_stop=should_stop)
+            external=ext, log=log, should_stop=should_stop)
         if dropped and not summary.get("stopped"):
             log("⚠ %d 条译文含原文没有的 [变量](运行时必崩),本次应用已拒用、"
                 "这些行继续显示英文:改对变量名后重新应用即可" % len(dropped))
+        if not summary.get("stopped"):
+            # 基线随每次应用自动更新(工单 08):下次应用前以此为参照检测外部变更
+            self._refresh_tl_baseline()
         return summary
+
+    def restore_apply(self, apply_id, log=None):
+        """还原到某次应用之前（恢复点对话框触发）：撤销后刷新应用基线。"""
+        r = applytxn.restore(self.work, self.game_base, apply_id, log)
+        self._refresh_tl_baseline()
+        return r
+
+    def deactivate(self, log=None):
+        """停用汉化（包装 core.applytxn.deactivate）：撤销工具文件后刷新应用基线，
+        避免工具自身的还原动作在下一次应用前被误报为外部译文变更。"""
+        s = applytxn.deactivate(self.work, self.game_base, self.cfg, self.language, log)
+        self._refresh_tl_baseline()
+        return s
 
     def apply_font(self, log):
         if self.cfg.get("apply_font", True):

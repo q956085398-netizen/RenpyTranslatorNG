@@ -766,6 +766,117 @@ except Exception as e:  # noqa: BLE001
     traceback.print_exc()
 
 # =====================================================================
+# 工单 08:外部 tl 变更检测 —— 基线自动保存、应用前检测、逐项导入/放弃留痕
+# =====================================================================
+try:
+    from core import externaltl
+
+    game8 = os.path.join(TMP, "games", "synth_basic_exttl")
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game8)
+    cfg8 = make_cfg(stub.base_url, FONT_PATH)
+    p8 = make_project(cfg8, game8, "synth_basic_exttl")
+    p8.extract_tl(log=lambda m: None)
+    p8.translate(log=lambda m: None)   # stub 服务连接翻译(项目库提交 + 回填)
+    s8 = p8.apply_txn(log=lambda m: None)
+    jobs8 = jobs_by_key(game8, os.path.join(p8.work, "dump.json"))
+    tl8 = os.path.join(game8, "game", "tl", "chinese", "script.rpy")
+
+    def exttl_confirm(mode):
+        """确认通道替身:按模式返回逐项决策(import/discard)或中止。"""
+        def confirm(message):
+            assert message.startswith("EXTTL:"), "外部变更确认协议走 EXTTL 通道"
+            payload = json.loads(message.split(":", 1)[1])
+            ids = [i["id"] for i in payload["items"]]
+            if mode == "abort":
+                return "abort"
+            imports = [i["id"] for i in payload["items"]
+                       if i["importable"]] if mode == "import" else []
+            return json.dumps({"import": imports,
+                               "discard": [i for i in ids if i not in imports]})
+        return confirm
+
+    def never_confirm(message):
+        raise AssertionError("无外部变更时不应弹出确认")
+
+    def game_tl_edit(was, now):
+        """在汉化工作台之外改写游戏 tl(只动非注释的代码行)。"""
+        out = []
+        hit = False
+        for ln in read(tl8).split("\n"):
+            if not ln.strip().startswith("#") and '"%s"' % was in ln:
+                ln, hit = ln.replace('"%s"' % was, '"%s"' % now, 1), True
+            out.append(ln)
+        assert hit, "外部改写没有命中译文行"
+        with open(tl8, "w", encoding="utf-8") as f:
+            f.write("\n".join(out))
+
+    check("外部变更:基线随首次应用自动保存",
+          externaltl.load_baseline(p8.work) is not None
+          and "script.rpy" in externaltl.load_baseline(p8.work)["files"],
+          s8["apply_id"])
+    # 无外部变更:再次应用不被打扰(确认通道一旦被调用即断言失败)
+    s8b = p8.apply_txn(log=lambda m: None, confirm=never_confirm)
+    check("外部变更:无变更不打扰,应用照常完成",
+          s8b["filled"] > 0 and s8b["external"] == {"detected": 0, "imported": 0,
+                                                    "discarded": 0})
+
+    # ---- 外部改写一句已回填译文:阻止直接覆盖 → 逐项导入(人工来源+保护) ----
+    key8 = next(k for k, j in jobs8.items()
+                if j["old"] == "Welcome to the Synth Vale.")
+    game_tl_edit("欢迎来到合成之谷。", "【手改】欢迎来到合成之谷。")
+    try:
+        p8.apply_txn(log=lambda m: None)
+        check("外部变更:无确认通道的应用被阻止", False, "竟然成功")
+    except externaltl.ExternalChangesError:
+        check("外部变更:无确认通道的应用被阻止(绝不静默覆盖)",
+              "【手改】" in read(tl8))
+    s8c = p8.apply_txn(log=lambda m: None, confirm=exttl_confirm("import"))
+    cur8 = p8.store().get_current(key8)
+    check("外部变更:逐项导入登记为人工来源的当前译文",
+          s8c["external"] == {"detected": 1, "imported": 1, "discarded": 0}
+          and cur8["text"] == "【手改】欢迎来到合成之谷。"
+          and cur8["source"] == "human" and cur8["confirmed"])
+    p8.store().record_model_result(key8, "【模型重译】外来译文。")
+    cur8 = p8.store().get_current(key8)
+    check("外部变更:导入的译文受人工译文保护(模型重译只进候选)",
+          cur8["text"] == "【手改】欢迎来到合成之谷。"
+          and any(c["text"] == "【模型重译】外来译文。"
+                  for c in p8.store().candidates(key8)))
+    ec8 = applytxn.load_manifest(p8.work, s8c["apply_id"]).get("external_changes")
+    check("外部变更:导入与放弃在应用清单留痕",
+          ec8 is not None and ec8["detected"] == 1 and ec8["imported"] == 1
+          and ec8["discarded"] == 0
+          and [i["action"] for i in ec8.get("items", [])] == ["imported"])
+    p8.apply_txn(log=lambda m: None, confirm=never_confirm)   # 基线已随应用更新
+
+    # ---- 外部再改一句:明确放弃(覆盖 + 留痕)与取消(中止,游戏不动) ----
+    game_tl_edit("这就走了？", "【手改】这就走了？")
+    s8d = p8.apply_txn(log=lambda m: None, confirm=exttl_confirm("discard"))
+    check("外部变更:明确放弃后本次应用覆盖外部值并留痕",
+          s8d["external"] == {"detected": 1, "imported": 0, "discarded": 1}
+          and '"【手改】这就走了？"' not in read(tl8)
+          and '"这就走了？"' in read(tl8)
+          and applytxn.load_manifest(p8.work, s8d["apply_id"])
+          ["external_changes"]["discarded"] == 1)
+    game_tl_edit("路还长着呢，[player_name]。", "【手改】长路漫漫。")
+    s8e = p8.apply_txn(log=lambda m: None, confirm=exttl_confirm("abort"))
+    check("外部变更:取消处理即中止应用,游戏目录保持现状",
+          s8e.get("stopped") and "【手改】长路漫漫。" in read(tl8)
+          and applytxn.load_manifest(p8.work, s8d["apply_id"])["apply_id"]
+          == applytxn.list_applies(p8.work)[0]["apply_id"])
+    p8.apply_txn(log=lambda m: None, confirm=exttl_confirm("import"))   # 收尾:导入
+
+    # ---- 工具自身动作不误报:恢复点还原后再次应用不打扰 ----
+    p8.restore_apply(s8["apply_id"], log=lambda m: None)
+    s8f = p8.apply_txn(log=lambda m: None, confirm=never_confirm)
+    check("外部变更:恢复点还原是工具动作,不误报为外部变更",
+          s8f["filled"] > 0 and s8f["external"]["detected"] == 0, s8f["apply_id"])
+except Exception as e:  # noqa: BLE001
+    import traceback
+    check("工单 08 外部变更回归无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
 # 清理（无论成败都恢复补丁与目录）
 # =====================================================================
 try:
