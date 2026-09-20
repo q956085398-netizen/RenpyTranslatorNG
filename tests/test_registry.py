@@ -74,8 +74,10 @@ def test_default_db_follows_app_dir(tmp_path, monkeypatch):
 
 # ---------- 同名游戏、不同路径：完全隔离 ----------
 
-def test_same_name_games_at_different_paths_are_isolated(reg, tmp_path):
+def test_same_name_games_at_different_paths_are_isolated(reg, tmp_path, monkeypatch):
     """同名目录的两个安装 = 两个项目：身份、资产目录互不相干（串数据为 0）。"""
+    # 资产目录随 app_dir 重定向进临时目录（reg fixture 只重定向注册库文件）
+    monkeypatch.setattr(util, "app_dir", lambda: str(tmp_path))
     a = os.path.join(tmp_path, "packA", "My Game")
     b = os.path.join(tmp_path, "packB", "My Game")
     pa = reg.create_project("My Game", a)
@@ -107,7 +109,8 @@ def test_store_dir_never_derives_from_game_dir_name(tmp_path, monkeypatch):
 
 # ---------- 重新定位（目录改名/移动） ----------
 
-def test_relocate_repoints_project_and_keeps_assets(reg, tmp_path):
+def test_relocate_repoints_project_and_keeps_assets(reg, tmp_path, monkeypatch):
+    monkeypatch.setattr(util, "app_dir", lambda: str(tmp_path))  # 资产目录进临时目录
     old = os.path.join(tmp_path, "old place", "My Game")
     os.makedirs(old)
     p = reg.create_project("My Game", old)

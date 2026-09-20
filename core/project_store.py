@@ -483,13 +483,14 @@ class ProjectStore:
                          " AND confirmed = 0", (STATUS_CURRENT,))
         return kept
 
-    def import_currents(self, mapping):
+    def import_currents(self, mapping, source="import"):
         """旧版整份缓存（translations.json）一次性导入：只补空位，绝不覆盖。
 
         仅接受最近一次提取中仍存在、且既无当前译文也无迁移建议的出现位置——
         已降级为迁移建议的译文不因镜像文件里的旧值复活（重新采用必须经用户
         确认）；不在提取结果中的出现位置和旧缓存里的死数据一样跳过。
-        重复调用幂等。返回 {"imported": n, "skipped": m}。
+        source 记录导入来源：旧版镜像文件的例行导入用 import，旧数据迁移
+        （core.migration）用 migration。重复调用幂等。返回 {"imported": n, "skipped": m}。
         """
         imported = skipped = 0
         with self._conn() as conn:
@@ -507,9 +508,36 @@ class ProjectStore:
                 if occ is None or not occ["active"] or has_record is not None:
                     skipped += 1
                     continue
-                self._insert_translation(conn, oid, text, "current", "import", False)
+                self._insert_translation(conn, oid, text, "current", source, False)
                 imported += 1
         return {"imported": imported, "skipped": skipped}
+
+    def record_migration_suggestions(self, mapping, note="旧数据迁移：出现位置结构已变化，确认后可采用"):
+        """把迁移数据中无法安全自动继承的旧译文登记为迁移建议（ADR-0001）。
+
+        只登记出现位置已存在的条目（迁移建议必须绑定出现位置）；同文本建议
+        已存在的不重复登记。采用经 adopt_candidate（用户动作）。返回登记条数。
+        """
+        n = 0
+        with self._conn() as conn:
+            for oid, text in (mapping or {}).items():
+                if not isinstance(text, str) or not text:
+                    continue
+                known = conn.execute(
+                    "SELECT 1 FROM occurrences WHERE occurrence_id = ?",
+                    (oid,)).fetchone()
+                if known is None:
+                    continue
+                dup = conn.execute(
+                    "SELECT 1 FROM translations WHERE occurrence_id = ?"
+                    " AND status = ? AND text = ?",
+                    (oid, STATUS_SUGGESTION, text)).fetchone()
+                if dup is not None:
+                    continue
+                self._insert_translation(conn, oid, text, STATUS_SUGGESTION,
+                                         "migration", False, note=note)
+                n += 1
+        return n
 
     # ---------- 汇总对账 ----------
 

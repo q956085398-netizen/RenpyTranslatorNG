@@ -180,6 +180,16 @@ class Registry:
             raise ValueError("该路径已是其它汉化项目的游戏安装") from None
         return self.get(project_id)
 
+    def delete_project(self, project_id):
+        """删除汉化项目的登记与其全部游戏安装关联（级联）。
+
+        项目资产目录（work/<项目身份>/）由调用方处理；用于迁移失败回滚等
+        需要整体撤销登记的场景。返回是否删除了记录。
+        """
+        cur = self.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def touch(self, project_id):
         self.conn.execute("UPDATE projects SET last_opened_at = ? WHERE id = ?",
                           (time.time(), project_id))

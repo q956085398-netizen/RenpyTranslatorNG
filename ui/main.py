@@ -27,6 +27,7 @@ from core.pipeline import Project
 from core import coordinator
 from core import fontpatch
 from core import library as gamelib
+from core import migration
 from core import relations as rel
 from core import registry as projreg
 from core import updates as upd
@@ -384,6 +385,8 @@ class MainWindow(QMainWindow):
         # 评分不做自动检查（点「⭐ 更新评分」手动查），版本这边只补查过期的。
         if self.cfg.get("auto_check_updates", True):
             QTimer.singleShot(1500, self.lib_page.auto_check)
+        # 旧数据自动迁移：启动后扫描旧版 work/<游戏目录名>/ 数据，预览确认后导入
+        QTimer.singleShot(600, self._offer_legacy_migration)
 
     # ---------- 布局 ----------
     PAGE_TITLES = {"flow": "流程", "glossary": "词汇表", "chars": "人物关系",
@@ -1099,6 +1102,17 @@ class MainWindow(QMainWindow):
         save.clicked.connect(self._save_settings)
         cv.addWidget(save)
         v.addWidget(card)
+        card, cv = self._card("数据维护")
+        rowm = QHBoxLayout()
+        lblm = QLabel("从最近一次旧数据迁移备份还原旧项目数据、游戏库记录与应用配置"
+                      "（迁移前自动创建，覆盖现有同名文件，不影响汉化项目及其项目资产）")
+        lblm.setWordWrap(True)
+        btn_restore = QPushButton("从迁移备份恢复…")
+        btn_restore.clicked.connect(self._restore_migration_backup)
+        rowm.addWidget(lblm, 1)
+        rowm.addWidget(btn_restore)
+        cv.addLayout(rowm)
+        v.addWidget(card)
         v.addStretch(1)
         return page
 
@@ -1258,6 +1272,98 @@ class MainWindow(QMainWindow):
         if not ok:
             return None
         return stale[labels.index(item)]
+
+    # ---------- 旧数据自动迁移（工单 04：升级首次启动扫描旧版数据） ----------
+
+    def _offer_legacy_migration(self):
+        """窗口显示后后台扫描旧版数据；有可迁移内容时弹出预览供确认。
+
+        扫描只读不改；已有任务在运行时本次不弹（下次启动还会再扫描）。"""
+        if self.worker and self.worker.isRunning():
+            return
+        t = FetchThread(migration.scan)
+        self._fetch_threads.append(t)
+        t.sig_done.connect(self._on_legacy_scan)
+        t.start()
+
+    def _on_legacy_scan(self, ok, info):
+        if not ok or not isinstance(info, dict):
+            return
+        pending = [p for p in info.get("projects", [])
+                   if not p["done"] and p["match"]["status"] in ("new", "merge")]
+        if not pending:
+            return   # 没有可迁移的项目：已迁移/暂不可迁移的静默跳过，不打扰启动
+        lines = []
+        for p in info["projects"]:
+            if p["done"]:
+                continue
+            m = p["match"]
+            if m["status"] in ("new", "merge"):
+                n_rev = p["counts"]["translations"] - p["plan"]["translations_importable"]
+                lines.append("• %s：译文 %d 条（可导入 %d 条，%d 条待检查）"
+                             % (p["name"], p["counts"]["translations"],
+                                p["plan"]["translations_importable"], n_rev))
+            elif m["status"] == "missing":
+                lines.append("• %s：找不到对应的游戏安装，暂不迁移（数据保留在原目录）"
+                             % p["name"])
+            else:
+                lines.append("• %s：同名游戏安装有多个，无法自动确定，暂不迁移" % p["name"])
+        n_review = sum(len(p["review_items"]) for p in info["projects"]) \
+            + len(info.get("review_items", []))
+        msg = ("检测到旧版数据，可以迁移到新版项目结构（按项目身份存放，译文进入"
+               "项目数据库）：\n\n%s\n\n游戏库记录与应用配置保持原样继续使用；"
+               "迁移前会自动创建备份，可随时恢复。"
+               % "\n".join(lines))
+        if n_review:
+            msg += "\n另有 %d 条待检查项（迁移后在「① 流程」页的任务摘要里逐条列出）。" % n_review
+        ret = QMessageBox.question(
+            self, "旧数据迁移", msg + "\n\n现在开始迁移吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self._goto("flow")
+        self._run(lambda log, prog, should_stop, ask: self._do_legacy_migration(log))
+
+    def _do_legacy_migration(self, log):
+        """在后台执行迁移并输出任务摘要（备份位置、对账结果、待检查项清单）。"""
+        report = migration.apply(log=log)
+        p, t = report["projects"], report["translations"]
+        if not report["backup_dir"]:
+            return "没有需要迁移的旧数据"
+        log("迁移备份：%s（可在 设置 → 数据维护 从备份恢复）" % report["backup_dir"])
+        log("任务摘要：项目 新建 %d / 并入 %d / 跳过 %d；译文 导入 %d / 保留 %d / 待检查 %d"
+            % (p["created"], p["merged"], p["skipped"], t["imported"], t["kept"], t["review"]))
+        for item in report["review_items"]:
+            log("待检查：%s — %s（来源：%s）"
+                % (item["key"], item["detail"], item["source"]))
+        if not report["reconciled"]:
+            log("⚠ 译文对账不平：共 %d 条，与导入/保留/待检查之和不一致，请人工核查" % t["total"])
+        return ("迁移完成：新建 %d 个项目、并入 %d 个；导入译文 %d 条，待检查 %d 条"
+                "（失败可从备份恢复）" % (p["created"], p["merged"], t["imported"], t["review"]))
+
+    def _restore_migration_backup(self):
+        ret = QMessageBox.question(
+            self, "恢复迁移备份",
+            "把最近一次迁移备份里的文件复制回原位（覆盖现有同名文件）：\n"
+            "旧项目数据（work/ 下按游戏安装目录名存放的旧目录）、\n"
+            "library.json 与 config.json。\n"
+            "不会删除备份之外的新文件，汉化项目与其项目资产不受影响。\n\n"
+            "确定恢复吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self._goto("flow")
+        self._run(lambda log, prog, should_stop, ask: self._do_restore_backup(log))
+
+    def _do_restore_backup(self, log):
+        n = migration.restore_backup()
+        if not n:
+            return "没有可用的迁移备份"
+        log("已从最近一次迁移备份还原 %d 个文件" % n)
+        return ("恢复完成：共还原 %d 个文件（如需重新迁移，"
+                "删除对应旧目录里的 _migrated.json 标记后重启即可）" % n)
 
     def _project(self):
         base = self.ed_game.text().strip()
