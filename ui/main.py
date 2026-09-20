@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,14 +18,15 @@ from PySide6.QtGui import (QBrush, QColor, QIcon, QLinearGradient, QPainter,
                            QTextDocument)
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
-    QFileDialog, QFormLayout, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate,
-    QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSplitter, QStackedWidget, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget)
 
 from core.config import Config
-from core.pipeline import Project
+from core.pipeline import Project, editor_row_state
 from core import applytxn
 from core import coordinator
 from core import fontpatch
@@ -32,8 +34,9 @@ from core import library as gamelib
 from core import migration
 from core import relations as rel
 from core import registry as projreg
+from core import texttags
 from core import updates as upd
-from core.translator import DEFAULT_SYSTEM_PROMPT
+from core.translator import DEFAULT_SYSTEM_PROMPT, fix_rpy_tags
 from core.util import read_json, write_json
 
 from . import theme
@@ -654,6 +657,296 @@ class ExternalChangesDialog(QDialog):
         self.diff.setPlainText("\n".join(parts))
 
 
+class EditTranslationDialog(QDialog):
+    """单条译文编辑（工单 09）：“修改此处”与“替换全部相同原文”是两个明确动作。
+
+    - 修改即时自动保存为项目草稿（输入停顿 0.7s 落库，关窗时立即补存——
+      切页、关窗、崩溃最多丢最后一次停顿内的输入），界面显示保存状态——
+      保存草稿与应用到游戏是两个语义不同的动作，这里只做前者；
+    - 译文只写当前出现位置：相同原文的其他位置互不影响；要统一译法用
+      「替换全部 N 处相同原文」——显式批量操作，执行前展示影响范围；
+    - 候选译文与迁移建议并排比较：采用（成为人工确认的当前译文）或忽略
+      （删除这条待比较结果）。翻译任务运行期间与人工编辑冲突的结果、
+      重译请求的结果都在这里处理；
+    - 请求重译：下次翻译时单独重发这个出现位置（人工定稿保持回填，新结果
+      作为候选到达，不会覆盖）。
+
+    本会话内的连续编辑对当前译文原位改写（不把每个停顿都堆成版本历史），
+    仅当当前译文仍是本会话上一次写入的内容时才原位改写——中途有其他写入方
+    （如翻译任务）接管时退回标准人工译文入口，正确降级保留旧版本。
+    """
+
+    SAVE_DEBOUNCE_MS = 700
+    SOURCE_LABELS = {"model": "模型", "human": "人工", "migration": "迁移", "import": "导入"}
+
+    def __init__(self, store, row, siblings=None, on_saved=None, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.row = row                    # 编辑页数据行（pipeline.editor_rows 的元素）
+        self.siblings = siblings or [row]  # 相同翻译源的全部出现位置（含本行）
+        self.on_saved = on_saved          # 自动保存回执：主界面刷新受影响行与保存状态
+        self.saved_keys = []              # 本对话框写过的出现位置（主界面据此刷镜像）
+        self._claimed = False             # 本会话是否已把当前译文接管为人工
+        self._loaded = row["trans"]       # 已落库的文本（与文本框比对判脏）
+        self._dirty = False
+        self.setWindowTitle("修改译文（出现位置：%s）" % row["key"])
+        self.resize(780, 620)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(8)
+
+        meta = ["%s · 说话人 %s" % ("对白" if row["kind"] == "say" else "界面文本",
+                                    row["who"].strip('"') or "旁白"),
+                "文件 %s" % row["file"]]
+        if row["src_file"]:
+            meta.append("脚本 %s" % row["src_file"])
+        if row["same_source"] > 1:
+            meta.append("相同原文共 %d 处（互不影响）" % row["same_source"])
+        lb_meta = QLabel("　|　".join(meta))
+        lb_meta.setObjectName("dim")
+        lb_meta.setWordWrap(True)
+        v.addWidget(lb_meta)
+
+        v.addWidget(QLabel("原文："))
+        self.ed_src = QPlainTextEdit()
+        self.ed_src.setReadOnly(True)
+        self.ed_src.setPlainText(row["source"])
+        self.ed_src.setMaximumHeight(92)
+        v.addWidget(self.ed_src)
+        if row["anchor"] and row["anchor"] != row["source"]:
+            lb_patch = QLabel("（这句被 ipatch 补丁改写过，补丁前：%s —— 译文按补丁后文本翻译）"
+                              % row["anchor"])
+            lb_patch.setObjectName("dim")
+            lb_patch.setWordWrap(True)
+            v.addWidget(lb_patch)
+
+        v.addWidget(QLabel("译文（自动保存为项目草稿）："))
+        self.ed_trans = QPlainTextEdit()
+        self.ed_trans.setPlainText(row["trans"])
+        v.addWidget(self.ed_trans, 3)
+        self.lb_check = QLabel("")
+        self.lb_check.setTextFormat(Qt.TextFormat.RichText)
+        self.lb_check.setWordWrap(True)
+        v.addWidget(self.lb_check)
+        self.ed_trans.textChanged.connect(self._on_text_changed)
+
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(self.SAVE_DEBOUNCE_MS)
+        self._save_timer.timeout.connect(self._flush_save)
+
+        self.lb_save = QLabel("修改会自动保存为项目草稿（未应用到游戏）")
+        self.lb_save.setObjectName("dim")
+        v.addWidget(self.lb_save)
+
+        row_btns = QHBoxLayout()
+        btn_retrans = QPushButton("↻ 请求重译")
+        btn_retrans.setToolTip(
+            "对这个出现位置发起重译请求：下次执行第 5 步（或「重译未译句子」）时单独重新请求它。\n"
+            "人工确认的译文保持当前并继续回填，新结果作为候选译文到达（在下面的待检查区比较）；\n"
+            "未确认的模型译文会被新结果直接更新。")
+        btn_retrans.clicked.connect(self._request_retranslate)
+        row_btns.addWidget(btn_retrans)
+        row_btns.addStretch(1)
+        if row["same_source"] > 1:
+            btn_all = QPushButton("替换全部 %d 处相同原文…" % row["same_source"])
+            btn_all.setToolTip("把这份译文应用到相同原文的全部出现位置（显式批量操作，先展示影响范围）")
+            btn_all.clicked.connect(self._replace_all)
+            row_btns.addWidget(btn_all)
+        btn_close = QPushButton("关闭")
+        btn_close.setDefault(True)
+        btn_close.clicked.connect(self.accept)
+        row_btns.addWidget(btn_close)
+        v.addLayout(row_btns)
+        self._pending_box = None
+        self._build_pending()
+
+    # ---------- 自动保存（项目草稿） ----------
+
+    def _on_text_changed(self):
+        if self.ed_trans.toPlainText() == self._loaded:
+            self._dirty = False
+            self._save_timer.stop()
+            return
+        self._dirty = True
+        self.lb_save.setText("正在输入…停顿后自动保存为项目草稿")
+        self._revalidate()
+        self._save_timer.start()
+
+    def _flush_save(self):
+        """把文本框当前内容落库（停顿触发 / 关窗触发）。"""
+        if not self._dirty:
+            return
+        text = self.ed_trans.toPlainText()
+        key = self.row["key"]
+        # 会话首次写入（含打开前就存在的人工译文）走标准入口，旧值降为候选
+        # 保留；此后本会话的连续编辑才原位改写（不堆版本历史）
+        if not (self._claimed
+                and self.store.rewrite_human_if_current(key, self._loaded, text)):
+            self.store.set_human_translation(key, text)
+        self._note_saved(text)
+
+    def _note_saved(self, text):
+        """落库后的会话状态收尾（自动保存与采用候选共用）。"""
+        self._claimed = True
+        self._loaded = text
+        self._dirty = False
+        if self.row["key"] not in self.saved_keys:
+            self.saved_keys.append(self.row["key"])
+        self._mark_saved()
+        if self.on_saved is not None:
+            self.on_saved([self.row["key"]])
+
+    def _mark_saved(self):
+        self.lb_save.setText("✓ 已自动保存为项目草稿 · %s（未应用到游戏；点「应用修改到游戏」生效）"
+                             % time.strftime("%H:%M:%S"))
+
+    def done(self, result):
+        """任何出口（关闭按钮、Esc、右上角）都先把未落库的输入保存成草稿。"""
+        self._save_timer.stop()
+        self._flush_save()
+        super().done(result)
+
+    def _revalidate(self):
+        """与回填同一套校验：提前发现"应用时会被拒用、该行显示英文"的译文。"""
+        text = self.ed_trans.toPlainText()
+        t = fix_rpy_tags(text)
+        _t, bad = texttags.fix_interps(self.row["source"], t)
+        if bad:
+            msg = "⚠ 译文包含原文没有的 %s：应用时会拒用这一行、显示英文" % bad
+        elif t.count("{}") != self.row["source"].count("{}"):
+            msg = "⚠ 译文与原文的 {} 占位符数量不一致：应用时会拒用这一行、显示英文"
+        else:
+            self.lb_check.setText("")
+            return
+        self.lb_check.setText('<span style="color:%s;">%s</span>'
+                              % (theme.token("STATE_ERR"), msg))
+
+    # ---------- 待检查区：候选译文 / 迁移建议 ----------
+
+    def _pending_items(self):
+        return self.store.candidates(self.row["key"]) + \
+            self.store.suggestions(self.row["key"])
+
+    def _build_pending(self):
+        if self._pending_box is not None:
+            self.layout().removeWidget(self._pending_box)
+            self._pending_box.deleteLater()
+            self._pending_box = None
+        items = self._pending_items()
+        if not items:
+            return
+        box = QGroupBox("待检查（比较后采用，或忽略）")
+        bv = QVBoxLayout(box)
+        bv.setContentsMargins(10, 8, 10, 8)
+        bv.setSpacing(8)
+        for it in items:
+            bv.addWidget(self._pending_item(it))
+        self._pending_box = box
+        # 插在保存状态标签之前（按钮行始终垫底）
+        self.layout().insertWidget(self.layout().indexOf(self.lb_save), box)
+
+    def _pending_item(self, it):
+        """一条候选/迁移建议：译文 + 来源说明 + 采用/忽略。"""
+        frame = QFrame()
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        fv = QVBoxLayout(frame)
+        fv.setContentsMargins(8, 6, 8, 6)
+        fv.setSpacing(2)
+        head = "%s译文 · %s" % ("迁移建议（旧译文，出现位置结构已变化）"
+                               if it["status"] == "suggestion" else "候选译文",
+                               self.SOURCE_LABELS.get(it["source"], it["source"]))
+        if it.get("updated_at"):
+            head += " · %s" % time.strftime("%m-%d %H:%M", time.localtime(it["updated_at"]))
+        lb_head = QLabel(head)
+        lb_head.setObjectName("dim")
+        fv.addWidget(lb_head)
+        lb_text = QLabel(it["text"] or "（空）")
+        lb_text.setWordWrap(True)
+        lb_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        fv.addWidget(lb_text)
+        if it.get("note"):
+            lb_note = QLabel(it["note"])
+            lb_note.setObjectName("dim")
+            lb_note.setWordWrap(True)
+            fv.addWidget(lb_note)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_adopt = QPushButton("✔ 采用")
+        btn_adopt.setToolTip("把这条结果采用为当前译文（人工确认，受人工译文保护）")
+        btn_adopt.clicked.connect(lambda _=False, x=it: self._adopt(x))
+        btn_drop = QPushButton("✕ 忽略")
+        btn_drop.setToolTip("删除这条待比较结果（当前译文不受影响）")
+        btn_drop.clicked.connect(lambda _=False, x=it: self._dismiss(x))
+        row.addWidget(btn_adopt)
+        row.addWidget(btn_drop)
+        fv.addLayout(row)
+        return frame
+
+    def _adopt(self, item):
+        self._save_timer.stop()
+        self._dirty = False            # 文本框即将换成采用结果，不再保存旧输入
+        self.store.adopt_candidate(self.row["key"], item["id"])
+        self._note_saved(item["text"])  # 先更新会话状态，setPlainText 才不会被当成新输入
+        self.ed_trans.setPlainText(item["text"])
+        self._build_pending()
+
+    def _dismiss(self, item):
+        self.store.dismiss_candidate(self.row["key"], item["id"])
+        self._build_pending()
+        if self.on_saved is not None:
+            self.on_saved([self.row["key"]])
+
+    # ---------- 显式批量操作 / 重译请求 ----------
+
+    def _replace_all(self):
+        """替换全部相同原文：先展示影响范围，确认后才写入。"""
+        self._flush_save()
+        text = self.ed_trans.toPlainText()
+        others = [r for r in self.siblings if r["key"] != self.row["key"]]
+        differ = [r for r in others if (r["trans"] or "") != text]
+        preview = "\n".join(
+            "· %s（%s）：%s" % (r["who"].strip('"') or "旁白", r["file"],
+                              (r["trans"] or "（未翻译）")[:46])
+            for r in others[:8])
+        if len(others) > 8:
+            preview += "\n…其余 %d 处" % (len(others) - 8)
+        box = QMessageBox(self)
+        box.setWindowTitle("替换全部相同原文")
+        box.setText("把这份译文应用到相同原文的全部 %d 个出现位置？\n"
+                    "其中 %d 处的当前译文与这份不同（将被改写）。\n\n%s\n\n"
+                    "替换立即写入项目草稿（登记为人工译文），点「应用修改到游戏」后生效。"
+                    % (len(others) + 1, len(differ), preview))
+        adopt_all = box.addButton("替换全部", QMessageBox.ButtonRole.YesRole)
+        box.addButton("取消", QMessageBox.ButtonRole.NoRole)
+        box.exec()
+        if box.clickedButton() is not adopt_all:
+            return
+        keys = []
+        for r in self.siblings:
+            self.store.set_human_translation(r["key"], text)
+            if r["key"] not in keys:
+                keys.append(r["key"])
+        self.saved_keys = keys
+        if self.on_saved is not None:
+            self.on_saved(keys)
+        self.accept()
+
+    def _request_retranslate(self):
+        ret = QMessageBox.question(
+            self, "请求重译",
+            "对这个出现位置发起重译请求？\n\n下次执行第 5 步（或「重译未译句子」）时会单独重新请求它：\n"
+            "· 人工确认的译文保持当前并继续回填，新结果作为候选译文到达（待检查）；\n"
+            "· 未确认的模型译文会被新结果直接更新。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self.store.request_retranslation(self.row["key"])
+        self.lb_save.setText("✓ 已登记重译请求 · %s（下次翻译时单独重发）"
+                             % time.strftime("%H:%M:%S"))
+
+
 class MainWindow(QMainWindow):
     sig_est = Signal(str)  # 工作线程里安全更新“统计工作量”标签
 
@@ -666,7 +959,9 @@ class MainWindow(QMainWindow):
         self._running_fn = None
         self._lib_running_fn = None
         self._fetch_threads = []
-        self._edit_groups = None
+        self._edit_rows = None       # 编辑页数据：每个文本出现位置一行（pipeline.editor_rows）
+        self._edit_shown = []        # 当前表格里实际显示的行（_edit_rows 的引用子集）
+        self._edit_store = None
         self._edit_path = ""
         self._edit_kw = ""
         self.setWindowTitle("RenpyTranslatorNG — Ren'Py 游戏汉化工具")
@@ -1019,9 +1314,12 @@ class MainWindow(QMainWindow):
         page = QWidget()
         v = QVBoxLayout(page)
         v.setContentsMargins(22, 18, 22, 18)
-        card, cv = self._card("译文修改（修正译名/称谓不一致——不必重新翻译）")
-        hint = QLabel("搜索译文中的关键词（如 哥哥/弟弟/某人名），结果会高亮显示；双击“译文”列可单独修改一条，"
-                      "或在下面填替换词后一键替换全部。修改立即写入缓存，点「应用修改到游戏」回填生效。")
+        card, cv = self._card("译文修改（按文本出现位置逐条校对）")
+        hint = QLabel(
+            "主列表的每一行是一个文本出现位置：同一句英文在不同人物或分支下可以有各自译文，"
+            "互不影响。双击一行修改：编辑自动保存为项目草稿（未应用到游戏）；相同原文要统一译法时，"
+            "在修改对话框里用「替换全部相同原文」（执行前展示影响范围）。下面填替换词可按关键词"
+            "批量替换命中的译文。点「应用修改到游戏」才写入游戏目录。")
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         cv.addWidget(hint)
@@ -1029,22 +1327,32 @@ class MainWindow(QMainWindow):
         self.ed_search = QLineEdit(placeholderText="关键词，如：哥哥、Guard、某人名…")
         self.cmb_scope = QComboBox()
         self.cmb_scope.addItems(["搜译文", "搜原文", "两者都搜"])
+        self.cmb_status = QComboBox()
+        self.cmb_status.addItems(["全部状态", "未翻译", "已有译文", "待检查", "人工确认"])
+        self.cmb_status.setToolTip(
+            "待检查 = 有候选译文（重译结果、翻译任务与人工编辑的冲突）或迁移建议"
+            "（源文本/结构变化后降级的旧译文），双击打开比较后采用或忽略")
+        self.cmb_status.currentIndexChanged.connect(lambda _: self._edit_search())
         self.btn_search = QPushButton("🔍 搜索")
         self.btn_search.setObjectName("primary")
         self.btn_search.clicked.connect(self._edit_search)
         self.ed_search.returnPressed.connect(self._edit_search)
         row.addWidget(self.ed_search, 1)
         row.addWidget(self.cmb_scope)
+        row.addWidget(self.cmb_status)
         row.addWidget(self.btn_search)
         cv.addLayout(row)
         self.lb_search = QLabel("请先在①页选择游戏目录")
         self.lb_search.setWordWrap(True)
         self.lb_search.setObjectName("dim")
         cv.addWidget(self.lb_search)
-        self.tbl_edit = QTableWidget(0, 3)
-        self.tbl_edit.setHorizontalHeaderLabels(["说话人", "原文 (English)", "译文（双击修改）"])
-        self.tbl_edit.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tbl_edit = QTableWidget(0, 4)
+        self.tbl_edit.setHorizontalHeaderLabels(
+            ["状态", "说话人", "原文 (English)", "译文（双击修改）"])
         self.tbl_edit.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.tbl_edit.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.tbl_edit.setColumnWidth(0, 84)
+        self.tbl_edit.setColumnWidth(1, 96)
         self.tbl_edit.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl_edit.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_edit.setWordWrap(True)
@@ -1052,10 +1360,15 @@ class MainWindow(QMainWindow):
         self.tbl_edit.verticalHeader().setDefaultSectionSize(26)
         self.tbl_edit.doubleClicked.connect(self._edit_dblclick)
         cv.addWidget(self.tbl_edit, 1)
+        self.lb_save = QLabel("编辑会自动保存为项目草稿；「应用到游戏」才会修改游戏目录")
+        self.lb_save.setObjectName("dim")
+        self.lb_save.setWordWrap(True)
+        cv.addWidget(self.lb_save)
         row2 = QHBoxLayout()
         self.ed_replace = QLineEdit(placeholderText="替换为…")
         btn_replace = QPushButton("一键替换全部")
-        btn_replace.setToolTip("把所有译文中出现的关键词（上面搜索框里的词）替换为这里填的词")
+        btn_replace.setToolTip("把所有译文中出现的关键词（上面搜索框里的词）替换为这里填的词\n"
+                               "显式批量操作：执行前展示影响范围（多少处译文、多少处出现）")
         btn_replace.clicked.connect(self._edit_replace_all)
         self.btn_edit_fix = QPushButton("🔧 修复标签错乱")
         self.btn_edit_fix.setToolTip("修复缓存译文里 {/i} 被当成 {i}、{ i } 带空格等标签问题。\n"
@@ -1077,147 +1390,203 @@ class MainWindow(QMainWindow):
         v.addWidget(card, 1)
         return page
 
-    # ---------- 译文修改 ----------
+    # ---------- 译文修改（工单 09：按文本出现位置加载与保存） ----------
     def _edit_reload(self):
-        """(重新)载入当前游戏的 jobs + 译文缓存，按唯一文本分组。"""
-        self._edit_groups = None
+        """(重新)载入编辑页数据：每个文本出现位置一行。
+
+        任务清单总是从当前提取结果重建（pipeline.editor_rows）——重新提取后
+        编辑页立即使用最新任务清单，编辑的都是游戏里仍存在的出现位置。"""
+        self._edit_rows = None
+        self._edit_shown = []
         self._edit_kw = ""
         try:
             p = self._project()
         except Exception as e:
             self.lb_search.setText(str(e))
             return False
-        jobs = read_json(os.path.join(p.work, "jobs.json"), None)
-        if not jobs:
-            try:
-                jobs, _ = p._jobs(lambda s: None)
-            except Exception as e:
-                self.lb_search.setText("加载失败：%s（先执行提取和翻译）" % e)
-                return False
-        store = p.ensure_store(jobs)
-        trans = store.currents()
-        groups, bytext = [], {}
-        for j in jobs:
-            if not j.get("old"):
-                continue
-            g = bytext.get(j["old"])
-            if g is None:
-                g = {"old": j["old"], "who": j.get("who", ""), "file": j.get("file", ""),
-                     "keys": [], "trans": ""}
-                bytext[j["old"]] = g
-                groups.append(g)
-            g["keys"].append(j["key"])
-        for g in groups:
-            for k in g["keys"]:
-                t = trans.get(k)
-                if t:
-                    g["trans"] = t
-                    break
-        self._edit_groups = groups
-        self._edit_store = store
+        try:
+            rows = p.editor_rows()
+        except Exception as e:
+            self.lb_search.setText("加载失败：%s（先在①页执行「3. 提取+生成tl」）" % e)
+            return False
+        self._edit_rows = rows
+        self._edit_store = p.store()
         self._edit_path = os.path.join(p.work, "translations.json")
-        done = sum(1 for g in groups if g["trans"])
-        self.lb_search.setText("已载入：%d 条唯一文本，其中已译 %d 条。输入关键词开始搜索" % (len(groups), done))
+        done = sum(1 for r in rows if r["trans"])
+        review = sum(1 for r in rows if r["candidates"] or r["suggestions"])
+        self.lb_search.setText("已载入 %d 个出现位置：已译 %d、未译 %d、待检查 %d。"
+                               "输入关键词或选状态筛选"
+                               % (len(rows), done, len(rows) - done, review))
         return True
 
+    def _edit_state_info(self, r):
+        """行状态：(文本, 主题色 token 或 None, 工具提示)。"""
+        tips = []
+        if r["candidates"]:
+            tips.append("候选译文 %d 条（重译结果 / 翻译任务与人工编辑的冲突 / 被替换的旧版本）"
+                        % r["candidates"])
+        if r["suggestions"]:
+            tips.append("迁移建议 %d 条（源文本或出现位置结构已变化，确认后可采用）"
+                        % r["suggestions"])
+        if tips:
+            lead = ("当前为人工定稿、保持不动；" if r["trans"] and r["confirmed"] else "")
+            return "待检查", "STATE_BUSY", lead + "；".join(tips) + "。双击打开比较后采用或忽略"
+        if not r["trans"]:
+            return "未翻译", None, "尚无译文（应用后该行显示英文原文）"
+        if r["confirmed"]:
+            return "人工", "STATE_OK", "人工译文：不会被重新翻译、重新提取或项目迁移自动覆盖"
+        return "模型", None, "模型译文：未经人工确认"
+
+    def _edit_row_tip(self, r):
+        tip = "%s\n位置：%s" % (r["file"], r["key"])
+        if r["src_file"]:
+            tip += "\n脚本：%s" % r["src_file"]
+        if r["anchor"] and r["anchor"] != r["source"]:
+            tip += "\n补丁改写前：%s" % r["anchor"]
+        if r["same_source"] > 1:
+            tip += "\n相同原文共 %d 处（互不影响；统一译法用修改对话框的「替换全部」）" % r["same_source"]
+        return tip
+
+    def _edit_fill_row(self, i, r):
+        """把一行数据画进表格第 i 行（搜索结果构建与保存后局部刷新共用）。"""
+        state, color, state_tip = self._edit_state_info(r)
+        who = r["who"].strip('"')
+        if r["kind"] == "string":
+            who = "—"                       # 界面文本没有说话人
+        cells = [(state, state_tip), (who or "(旁白)", None),
+                 (r["source"], None), (r["trans"] or "（未翻译）", None)]
+        kw = self._edit_kw
+        row_tip = self._edit_row_tip(r)
+        for col, (txt, tip) in enumerate(cells):
+            it = QTableWidgetItem()
+            if col == 0 and color:
+                # RichTextDelegate 自绘单元格文本，颜色必须写进 HTML 才生效
+                it.setText('<span style="color:%s;">%s</span>'
+                           % (theme.token(color), html.escape(txt)))
+            else:
+                it.setText(_hl(txt, kw) if (kw and col) else html.escape(txt))
+            it.setData(Qt.ItemDataRole.UserRole, txt)
+            it.setToolTip(tip or row_tip)
+            self.tbl_edit.setItem(i, col, it)
+        self.tbl_edit.setRowHeight(i, 26)
+
     def _edit_search(self):
-        if self._edit_groups is None and not self._edit_reload():
+        if self._edit_rows is None and not self._edit_reload():
             return
         kw = self.ed_search.text().strip()
         self._edit_kw = kw
-        scope = self.cmb_scope.currentIndex()  # 0译文 1原文 2两者
+        scope = self.cmb_scope.currentIndex()          # 0译文 1原文 2两者
+        status = self.cmb_status.currentIndex()        # 0全部 1未翻译 2已有译文 3待检查 4人工确认
         rows = []
-        for g in self._edit_groups:
-            if not kw:
-                rows.append(g)
+        for r in self._edit_rows:
+            if status == 1 and r["trans"]:
                 continue
-            in_t = kw.lower() in (g["trans"] or "").lower()
-            in_o = kw.lower() in g["old"].lower()
+            if status == 2 and not r["trans"]:
+                continue
+            if status == 3 and not (r["candidates"] or r["suggestions"]):
+                continue
+            if status == 4 and not r["confirmed"]:
+                continue
+            if not kw:
+                rows.append(r)
+                continue
+            in_t = kw.lower() in (r["trans"] or "").lower()
+            in_o = kw.lower() in r["source"].lower()
             if (scope == 0 and in_t) or (scope == 1 and in_o) or (scope == 2 and (in_t or in_o)):
-                rows.append(g)
+                rows.append(r)
         cap = 800
         shown = rows[:cap]
+        self._edit_shown = shown
         self.tbl_edit.setRowCount(0)
-        for g in shown:
-            r = self.tbl_edit.rowCount()
-            self.tbl_edit.insertRow(r)
-            who = g["who"] or ""
-            if who.startswith('"') and who.endswith('"'):
-                who = who[1:-1]
-            items = [who or "(旁白)", g["old"], g["trans"] or "（未翻译）"]
-            for col, txt in enumerate(items):
-                it = QTableWidgetItem()
-                it.setText(_hl(txt, kw) if kw else html.escape(txt))
-                it.setData(Qt.ItemDataRole.UserRole, txt)
-                it.setToolTip("%s\n%s" % (g["file"], g["keys"][0] if g["keys"] else ""))
-                self.tbl_edit.setItem(r, col, it)
-            self.tbl_edit.setRowHeight(r, 26)
+        for i, r in enumerate(shown):
+            self.tbl_edit.insertRow(i)
+            self._edit_fill_row(i, r)
         more = "（仅显示前 %d 条）" % cap if len(rows) > cap else ""
-        self.lb_search.setText("命中 %d 条%s" % (len(rows), more))
+        self.lb_search.setText("命中 %d 个出现位置%s" % (len(rows), more))
 
     def _edit_dblclick(self, index):
-        if index.column() != 2 or self._edit_groups is None:
+        if self._edit_rows is None or self._edit_store is None:
             return
-        r = index.row()
-        old = self.tbl_edit.item(r, 1).data(Qt.ItemDataRole.UserRole)
-        cur = self.tbl_edit.item(r, 2).data(Qt.ItemDataRole.UserRole)
-        if cur == "（未翻译）":
-            cur = ""
-        txt, ok = QInputDialog.getMultiLineText(self, "修改译文", "原文：\n" + old[:500], cur)
-        if not ok:
+        if not (0 <= index.row() < len(self._edit_shown)):
             return
-        # 行号 -> 分组：行按搜索结果顺序生成，重新按原文找组
-        g = next((x for x in self._edit_groups if x["old"] == old), None)
-        if not g:
+        row = self._edit_shown[index.row()]
+        siblings = [r for r in self._edit_rows if r["source"] == row["source"]]
+        dlg = EditTranslationDialog(self._edit_store, row, siblings,
+                                    on_saved=self._edit_autosaved, parent=self)
+        dlg.exec()
+        if dlg.saved_keys:
+            # 对话框内的写动作已即时落库；派生镜像在此统一刷新一次
+            self._edit_sync_mirror()
+
+    def _edit_sync_mirror(self):
+        """编辑页写动作之后刷新派生镜像 translations.json（读取方沿用，工单 05）。"""
+        if self._edit_store is None:
             return
-        g["trans"] = txt
-        self._edit_persist([g])
-        item = self.tbl_edit.item(r, 2)
-        item.setText(_hl(txt, self._edit_kw) if self._edit_kw else html.escape(txt))
-        item.setData(Qt.ItemDataRole.UserRole, txt)
-        self._toast("已保存并写入缓存")
+        try:
+            write_json(self._edit_path, self._edit_store.currents())
+        except Exception:
+            pass    # 镜像滞后无害：项目库是可信来源，下次任务开跑前会整份对账
+
+    def _edit_autosaved(self, keys):
+        """编辑对话框写动作的回执：刷新受影响行与保存状态（不整页重建）。
+
+        状态更新覆盖全部已载入行（含被筛选/截断而不可见的——批量替换会写
+        到它们），表格只重画当前可见的那些。"""
+        if self._edit_store is None:
+            return
+        keyset = set(keys)
+        revs = self._edit_store.review_counts()
+        shown_at = {}
+        for i, r in enumerate(self._edit_shown):
+            shown_at[r["key"]] = i
+        for r in self._edit_rows:
+            if r["key"] not in keyset:
+                continue
+            r.update(editor_row_state(self._edit_store.get_current(r["key"]),
+                                      revs.get(r["key"])))
+            i = shown_at.get(r["key"])
+            if i is not None:
+                self._edit_fill_row(i, r)
+        self._edit_saved_at()
+
+    def _edit_saved_at(self):
+        self.lb_save.setText("✓ 已保存为项目草稿 · %s（未应用到游戏；点「应用修改到游戏」生效）"
+                             % time.strftime("%H:%M:%S"))
 
     def _edit_replace_all(self):
-        if self._edit_groups is None and not self._edit_reload():
+        """按关键词批量替换：显式批量操作，执行前展示影响范围。"""
+        if self._edit_rows is None and not self._edit_reload():
             return
         kw = self.ed_search.text().strip()
         repl = self.ed_replace.text()
         if not kw:
             QMessageBox.information(self, "替换", "请先在搜索框填写要替换的关键词")
             return
-        hits = [g for g in self._edit_groups if kw.lower() in (g["trans"] or "").lower()]
+        hits = [r for r in self._edit_rows if kw.lower() in (r["trans"] or "").lower()]
         if not hits:
             QMessageBox.information(self, "替换", "没有译文包含关键词「%s」" % kw)
             return
-        total = sum((g["trans"] or "").lower().count(kw.lower()) for g in hits)
+        total = sum((r["trans"] or "").lower().count(kw.lower()) for r in hits)
+        human = sum(1 for r in hits if r["confirmed"])
         box = QMessageBox(self)
-        box.setWindowTitle("确认替换")
-        box.setText("将把 %d 条译文中的「%s」（共 %d 处）全部替换为「%s」。\n替换会立即写入缓存，"
-                    "之后点「应用修改到游戏」回填生效。" % (len(hits), kw, total, repl))
-        box.addButton("替换", QMessageBox.YesRole)
-        box.addButton("取消", QMessageBox.NoRole)
+        box.setWindowTitle("确认批量替换")
+        box.setText("将把 %d 个出现位置的译文中的「%s」（共 %d 处）全部替换为「%s」。\n"
+                    "其中人工确认的译文 %d 条（替换后登记为人工译文，仍受保护）。\n"
+                    "替换立即写入项目草稿，之后点「应用修改到游戏」回填生效。"
+                    % (len(hits), kw, total, repl, human))
+        box.addButton("替换", QMessageBox.ButtonRole.YesRole)
+        box.addButton("取消", QMessageBox.ButtonRole.NoRole)
         if box.exec() != 0:
             return
-        for g in hits:
-            g["trans"] = _ci_replace(g["trans"], kw, repl)
-        self._edit_persist(hits)
-        self._edit_search()
-        self._toast("已替换 %d 条译文并写入缓存" % len(hits))
+        for r in hits:
+            self._edit_store.set_human_translation(r["key"], _ci_replace(r["trans"], kw, repl))
+        self._edit_autosaved([r["key"] for r in hits])
+        self._edit_sync_mirror()
+        self._toast("已替换 %d 条译文并保存为项目草稿" % len(hits))
 
     def _edit_fix_tags(self):
         """（已改为后台任务 _op_repair；此方法保留给老入口）"""
         self._run(self._op_repair)
-
-    def _edit_persist(self, groups):
-        """把分组译文写回项目库（人工译文，带确认状态；该组所有 key 同步，
-        保证续翻不再重译），并刷新派生镜像 translations.json。"""
-        store = getattr(self, "_edit_store", None)
-        if store is None:
-            return
-        for g in groups:
-            for k in g["keys"]:
-                store.set_human_translation(k, g["trans"])
-        write_json(self._edit_path, store.currents())
 
     def _page_settings(self):
         page = QWidget()
@@ -1841,10 +2210,12 @@ class MainWindow(QMainWindow):
             self.lb_prog.setText("✅ 完成")
             self.statusBar().showMessage("✅ %s" % msg, 10000)
             self._side_state("ok", "就绪")
-        # 编辑页数据可能已被任务改写（回填/修复），在用则刷新
-        if self._edit_groups is not None:
+        # 编辑页数据可能已被任务改写（翻译/回填/修复/重新提取），在用则刷新；
+        # 按当前搜索框与状态筛选重建可见行，不让表格停留在任务前的旧数据
+        if self._edit_rows is not None:
             try:
-                self._edit_reload()
+                if self._edit_reload():
+                    self._edit_search()
             except Exception:
                 pass
 

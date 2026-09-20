@@ -282,6 +282,17 @@ class ProjectStore:
                                 " WHERE status = ?", (STATUS_CURRENT,)).fetchall()
         return {r["occurrence_id"]: r["text"] for r in rows}
 
+    def current_records(self):
+        """全部当前译文记录（含来源与人工确认位）：{出现位置标识: 记录}。
+
+        编辑页状态列需要区分模型译文/人工译文（CONTEXT.md：人工译文受
+        保护），currents() 只给文本不够用。
+        """
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM translations WHERE status = ?",
+                                (STATUS_CURRENT,)).fetchall()
+        return {r["occurrence_id"]: self._trans_dict(r) for r in rows}
+
     def get_current(self, oid):
         with self._conn() as conn:
             row = self._current_row(conn, oid)
@@ -296,13 +307,52 @@ class ProjectStore:
                 (oid, STATUS_CANDIDATE)).fetchall()
         return [self._trans_dict(r) for r in rows]
 
-    def suggestions(self):
-        """迁移建议：因源文本/结构指纹变化或出现位置消失而降级的旧译文。"""
+    def suggestions(self, oid=None):
+        """迁移建议：因源文本/结构指纹变化或出现位置消失而降级的旧译文。
+
+        给 oid 时只取该出现位置的建议（编辑页打开单条时的 scoped 查询）。"""
+        q = "SELECT * FROM translations WHERE status = ?"
+        args = [STATUS_SUGGESTION]
+        if oid is not None:
+            q += " AND occurrence_id = ?"
+            args.append(oid)
+        with self._conn() as conn:
+            rows = conn.execute(q + " ORDER BY updated_at DESC", args).fetchall()
+        return [self._trans_dict(r) for r in rows]
+
+    def review_counts(self):
+        """待检查计数：{出现位置标识: {"candidates": n, "suggestions": m}}。
+
+        候选译文（重译结果、任务期间与人工编辑冲突的结果、被替换的旧版本）与
+        迁移建议都算待检查；只返回有待检查内容的出现位置。编辑页据此把行
+        标为待检查，逐条打开比较（candidates()/suggestions() 按需取明细）。
+        """
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM translations WHERE status = ?"
-                " ORDER BY updated_at DESC", (STATUS_SUGGESTION,)).fetchall()
-        return [self._trans_dict(r) for r in rows]
+                "SELECT occurrence_id, status, COUNT(*) AS n FROM translations"
+                " WHERE status IN (?, ?) GROUP BY occurrence_id, status",
+                (STATUS_CANDIDATE, STATUS_SUGGESTION)).fetchall()
+        out = {}
+        for r in rows:
+            d = out.setdefault(r["occurrence_id"], {"candidates": 0, "suggestions": 0})
+            d["candidates" if r["status"] == STATUS_CANDIDATE else "suggestions"] = r["n"]
+        return out
+
+    def history_texts(self):
+        """每个出现位置记录过的全部译文文本：{出现位置标识: {文本…}}。
+
+        覆盖当前译文、候选译文（含被人工编辑替换的旧版本）与迁移建议——这些
+        都是工具自己写进过游戏 tl 的值。无基线的首次应用前检测（ADR-0005）
+        用它区分"游戏 tl 停留在上一个工具写入值（项目草稿还没应用）"与真正的
+        外部译文变更。
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT occurrence_id, text FROM translations").fetchall()
+        out = {}
+        for r in rows:
+            out.setdefault(r["occurrence_id"], set()).add(r["text"])
+        return out
 
     @staticmethod
     def _trans_dict(row):
@@ -428,6 +478,22 @@ class ProjectStore:
                                (text, time.time(), oid, STATUS_CURRENT, text))
             return cur.rowcount > 0
 
+    def rewrite_human_if_current(self, oid, expect_text, new_text):
+        """编辑会话内的连续人工编辑：当前译文仍是会话上一次写入的内容时，
+        原位改写文本（不把每个输入停顿堆成版本历史、不污染待检查计数）。
+
+        当前译文已被其他写入方（翻译任务等）接管、或不是人工确认译文时
+        返回 False——调用方应改走 set_human_translation 标准入口，正确降级
+        保留旧版本。"""
+        with self._conn() as conn:
+            cur = self._current_row(conn, oid)
+            if (cur is None or not cur["confirmed"] or cur["source"] != "human"
+                    or cur["text"] != expect_text or expect_text == new_text):
+                return False
+            conn.execute("UPDATE translations SET text = ?, updated_at = ?"
+                         " WHERE id = ?", (new_text, time.time(), cur["id"]))
+            return True
+
     def adopt_candidate(self, oid, translation_id):
         """用户采用一条候选译文或迁移建议（用户动作）：它成为当前译文并视为
         人工确认——迁移建议"必须经过确认，不能当作当前译文直接应用"的采用入口。"""
@@ -444,6 +510,21 @@ class ProjectStore:
             conn.execute("UPDATE translations SET status = ?, confirmed = 1,"
                          " note = NULL, updated_at = ? WHERE id = ?",
                          (STATUS_CURRENT, time.time(), translation_id))
+
+    def dismiss_candidate(self, oid, translation_id):
+        """忽略一条候选译文/迁移建议（用户已查看并决定不采用）。
+
+        只作用于非当前译文：待比较结果忽略即删除，当前译文与其余版本不受
+        影响。这是"待检查项得到处理"的另一条出口（另一条是 adopt_candidate）。
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM translations WHERE id = ? AND occurrence_id = ?"
+                " AND status IN (?, ?)",
+                (translation_id, oid, STATUS_CANDIDATE, STATUS_SUGGESTION)).fetchone()
+            if row is None:
+                raise ValueError("可忽略的译文记录不存在：%s" % translation_id)
+            conn.execute("DELETE FROM translations WHERE id = ?", (translation_id,))
 
     # ---------- 译文记录维护（失效丢弃、清空、旧缓存导入） ----------
 

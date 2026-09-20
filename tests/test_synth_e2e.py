@@ -877,6 +877,130 @@ except Exception as e:  # noqa: BLE001
     traceback.print_exc()
 
 # =====================================================================
+# 工单 09:译文编辑页接入项目库 —— 出现位置行、独立编辑、批量替换、最新任务清单
+# =====================================================================
+try:
+    game9 = os.path.join(TMP, "games", "synth_basic_editor")
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game9)
+    p9 = make_project(make_cfg(stub.base_url, FONT_PATH), game9, "synth_basic_editor")
+    p9.extract_tl(log=lambda m: None)
+    p9.translate(log=lambda m: None)
+    store9 = p9.store()
+    tl9 = os.path.join(game9, "game", "tl", "chinese", "script.rpy")
+
+    # ---------- 主列表：一个文本出现位置一行，带状态 ----------
+    rows9 = p9.editor_rows()
+    jobs9 = jobs_by_key(game9, os.path.join(p9.work, "dump.json"))
+    check("编辑页按出现位置一行一条（与任务清单对账）",
+          len(rows9) == sum(1 for j in jobs9.values() if j.get("old")),
+          "%d rows" % len(rows9))
+    river9 = [r for r in rows9 if r["source"] == "The river remembers."]
+    check("同一原文的两个出现位置各占一行，same_source 标记影响范围",
+          len(river9) == 2 and all(r["same_source"] == 2 for r in river9))
+    check("已译行的状态字段（模型来源、未确认）",
+          all(r["trans"] == "河水记得。" and r["origin"] == "model"
+              and not r["confirmed"] for r in river9))
+    check("strings 行同表展示（说话人为空、kind=string）",
+          next(r for r in rows9 if r["key"] == "S:Leave")["who"] == "")
+
+    # ---------- 修改此处：只写当前出现位置，另一处不受影响 ----------
+    store9.set_human_translation(river9[0]["key"], "河水记得（编辑页定稿）。")
+    rows9 = p9.editor_rows()
+    river9 = [r for r in rows9 if r["source"] == "The river remembers."]
+    edited9 = next(r for r in river9 if r["trans"] == "河水记得（编辑页定稿）。")
+    other9 = next(r for r in river9 if r["key"] != edited9["key"])
+    check("修改此处只写当前出现位置（另一分支保持原译文）",
+          other9["trans"] == "河水记得。" and edited9["origin"] == "human"
+          and edited9["confirmed"])
+    check("保存草稿不修改游戏目录（应用到游戏才写入）",
+          "河水记得（编辑页定稿）。" not in read(tl9))
+    p9.apply_txn(log=lambda m: None)
+    content9 = read(tl9)
+    check("两处独立回填各自的译文",
+          content9.count('e "河水记得（编辑页定稿）。"') == 1
+          and content9.count('e "河水记得。"') == 1)
+
+    # ---------- 替换全部相同原文：显式批量（影响范围 = same_source 分组） ----------
+    for r in [x for x in rows9 if x["source"] == "The river remembers."]:
+        store9.set_human_translation(r["key"], "河水记得（统一译法）。")
+    p9.apply_txn(log=lambda m: None)
+    check("替换全部相同原文后两处一并更新",
+          read(tl9).count('e "河水记得（统一译法）。"') == 2)
+
+    # ---------- 冲突/重译结果进待检查，编辑页比较后采用或忽略 ----------
+    k9 = next(r["key"] for r in rows9 if r["source"] == "Welcome to the Synth Vale.")
+    store9.set_human_translation(k9, "欢迎来到合成之谷（人工定稿）。")
+    store9.record_model_result(k9, "【重译】合成谷欢迎你。")
+    row9 = next(r for r in p9.editor_rows() if r["key"] == k9)
+    check("人工译文与任务结果冲突：当前保持人工定稿，结果进候选（行标记待检查）",
+          row9["trans"] == "欢迎来到合成之谷（人工定稿）。" and row9["confirmed"]
+          and row9["candidates"] == 2,
+          "candidates=%d（重译结果 + 被替换的旧模型版本）" % row9["candidates"])
+    cand9 = next(c for c in store9.candidates(k9)
+                 if c["text"] == "【重译】合成谷欢迎你。")
+    store9.adopt_candidate(k9, cand9["id"])
+    cur9 = store9.get_current(k9)
+    row9 = next(r for r in p9.editor_rows() if r["key"] == k9)
+    check("采用候选后成为人工确认的当前译文，待检查清除一个",
+          cur9["text"] == "【重译】合成谷欢迎你。" and cur9["confirmed"]
+          and row9["candidates"] == 2,
+          "candidates=%d（被替换的人工定稿降为候选 + 旧模型版本）" % row9["candidates"])
+    old9 = next(c for c in store9.candidates(k9)
+                if c["text"] == "欢迎来到合成之谷（人工定稿）。")
+    store9.dismiss_candidate(k9, old9["id"])
+    check("忽略已比较过的候选（当前译文不受影响）",
+          next(r for r in p9.editor_rows() if r["key"] == k9)["candidates"] == 1
+          and store9.get_current(k9)["text"] == "【重译】合成谷欢迎你。")
+
+    # ---------- 重新提取后编辑页立即使用最新任务清单 ----------
+    road9 = next(r for r in rows9 if r["source"] == "The road is long, [player_name].")
+    script9 = os.path.join(game9, "game", "script.rpy")
+    with open(script9, "r", encoding="utf-8") as f:
+        src9 = f.read()
+    with open(script9, "w", encoding="utf-8") as f:
+        f.write(src9.replace("The road is long, [player_name].",
+                             "The road is longer now, [player_name]."))
+    p9.extract_tl(log=lambda m: None)
+    rows9b = p9.editor_rows()
+    new_road9 = next(r for r in rows9b
+                     if r["source"] == "The road is longer now, [player_name].")
+    check("重新提取后编辑页用最新任务清单（改写后的文本在列、未译）",
+          new_road9["trans"] == "" and not new_road9["confirmed"]
+          and not any(r["source"] == "The road is long, [player_name]." for r in rows9b))
+    check("消失位置的旧译文降为迁移建议（待检查，不静默丢弃）",
+          any(s["text"] == "路还长着呢，[player_name]。" for s in store9.suggestions()))
+    # 重新提取把 tl 骨架重写为新任务清单（旧块消失、新块未译）——应用前的
+    # 外部变更检测按基线对账把这处差异摆给用户决定（工单 08 语义）；这里
+    # 明确放弃（应用按当前任务清单重新回填）
+    def discard_all9(message):
+        assert message.startswith("EXTTL:"), "外部变更确认协议走 EXTTL 通道"
+        payload9 = json.loads(message.split(":", 1)[1])
+        assert all(not i["importable"] for i in payload9["items"]), \
+            "骨架重写产生的差异只应是不可导入的结构性条目"
+        return json.dumps({"import": [],
+                           "discard": [i["id"] for i in payload9["items"]]})
+
+    # 在最新清单上编辑并应用：一定写进游戏——不再"保存成功但游戏没有变化"
+    store9.set_human_translation(new_road9["key"], "长路漫漫，改写过的版本。")
+    p9.apply_txn(log=lambda m: None, confirm=discard_all9)
+    check("最新清单上的编辑经应用落到游戏 tl",
+          "长路漫漫，改写过的版本。" in read(tl9))
+
+    # ---------- 项目任务运行期间：浏览与非冲突草稿编辑照常 ----------
+    with coordinator.TaskCoordinator(store9).begin("翻译"):
+        rows_busy9 = p9.editor_rows()
+        store9.set_human_translation(other9["key"], "任务运行期间的人工编辑。")
+    check("任务运行期间编辑页照常加载（最新任务清单 + 项目库并行读）",
+          len(rows_busy9) == len(rows9b))
+    check("任务运行期间的非冲突草稿编辑成功落库（协调器不冻结浏览与编辑）",
+          store9.get_current(other9["key"])["text"] == "任务运行期间的人工编辑。"
+          and coordinator.TaskCoordinator(store9).history()[0]["state"] == "done")
+except Exception as e:  # noqa: BLE001
+    import traceback
+    check("工单 09 编辑页回归无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
 # 清理（无论成败都恢复补丁与目录）
 # =====================================================================
 try:

@@ -65,6 +65,19 @@ def _expand_translations(jobs, translations, dropped=None):
     return out, key_map
 
 
+def editor_row_state(cur, rev):
+    """一条出现位置行与项目库状态的联查字段（editor_rows 与界面局部刷新共用）。
+
+    cur 是当前译文记录（get_current/current_records 的元素，无则 None），
+    rev 是 review_counts 里该位置的计数（无待检查内容则 None）。"""
+    rev = rev or {}
+    return {"trans": cur["text"] if cur else "",
+            "origin": cur["source"] if cur else "",
+            "confirmed": bool(cur and cur["confirmed"]),
+            "candidates": rev.get("candidates", 0),
+            "suggestions": rev.get("suggestions", 0)}
+
+
 class Project:
     def __init__(self, cfg, game_base, project_id):
         """project_id：注册库登记的汉化项目稳定身份（core.registry）。
@@ -239,7 +252,7 @@ class Project:
         log("关系草表已生成：%d 个角色（请到“人物关系”页检查修正）" % len(chars))
         return chars
 
-    def _jobs(self, log, context_override=None):
+    def _jobs(self, log, context_override=None, persist=True):
         dump = self.load_dump()
         ctx = int(self.cfg["engine"].get("context_lines", 2))
         if context_override is not None:
@@ -256,12 +269,17 @@ class Project:
             n = ipatch.overlay_jobs(jobs, self._ov)
             if n:
                 log("ipatch 补丁覆盖：%d 条翻译源已替换为补丁后文本（译文仍按原文写回 tl）" % n)
+        # 同步是幂等的事务写（浏览路径也走这里：旧格式缓存导入与降级建议都
+        # 依赖出现位置在库；任务运行期间 dump 不变，同步不产生冲突写）
         self.store().sync_occurrences(self._occurrence_records(jobs))
         if not self.cfg.get("translate_strings", True):
             # 任务范围不含 strings(strings 文件仍在暂存集里随应用统一替换,
             # 只是不回填——回填过滤见 _fillable_files)
             jobs = [j for j in jobs if j["kind"] != "string"]
-        write_json(os.path.join(self.work, "jobs.json"), jobs)
+        if persist:
+            # 派生镜像（jobs.json）：任务路径写；编辑页浏览路径不写——项目任务
+            # 运行期间不再让第二个写入方碰它（工单 06 的纪律）
+            write_json(os.path.join(self.work, "jobs.json"), jobs)
         return jobs, tl_files
 
     def _fillable_files(self, tl_files, jobs):
@@ -272,6 +290,46 @@ class Project:
         keep = {j["file"] for j in jobs}
         tl_dir = os.path.join(self.game_base, "game", "tl", self.language)
         return [p for p in tl_files if os.path.relpath(p, tl_dir) in keep]
+
+    def editor_rows(self, log=None):
+        """译文编辑页数据（工单 09）：每个文本出现位置一行。
+
+        任务清单总是从当前提取结果重建，不走可能过期的 jobs.json——重新提取
+        后编辑页立即使用最新任务清单，编辑的都是游戏里仍存在的位置，杜绝
+        "保存成功但游戏没有变化"。行上联查项目库当前译文状态：
+
+        - source：玩家可见的翻译源（ipatch 补丁后；无补丁即 tl 锚点原文）；
+          anchor 为被补丁改写时的 tl 原文锚点，否则为空串；
+        - trans / origin / confirmed：当前译文、来源（model/human/…）与人工
+          确认位（人工译文受保护，ADR-0003）；
+        - candidates / suggestions：待检查计数（重译结果、任务期间冲突、
+          降级的迁移建议），明细经 store.candidates()/suggestions() 按需取；
+        - same_source：相同翻译源的出现位置总数（"替换全部相同原文"这一
+          显式批量操作的影响范围）。
+        """
+        log = log or (lambda m: None)
+        jobs, _tl_files = self._jobs(log, persist=False)
+        store = self._import_legacy_cache(log)
+        currents = store.current_records()
+        reviews = store.review_counts()
+        same_source = {}
+        for j in jobs:
+            if j.get("old"):
+                same_source[j["old"]] = same_source.get(j["old"], 0) + 1
+        rows = []
+        for j in jobs:
+            if not j.get("old"):
+                continue
+            row = {
+                "key": j["key"], "kind": j["kind"], "who": j.get("who", ""),
+                "file": j.get("file", ""), "src_file": j.get("src_file", ""),
+                "source": j["old"], "anchor": j.get("orig") or "",
+                "same_source": same_source[j["old"]],
+            }
+            row.update(editor_row_state(currents.get(j["key"]),
+                                        reviews.get(j["key"])))
+            rows.append(row)
+        return rows
 
     def estimate(self, log):
         jobs, _ = self._jobs(log)
@@ -399,7 +457,8 @@ class Project:
         """
         report = externaltl.detect_changes(
             self.game_base, self.work, self.language, jobs,
-            draft_expected=self._draft_expected(jobs, store))
+            draft_expected=self._draft_expected(jobs, store),
+            known_texts=store.history_texts())
         items = report["items"]
         ext = {"detected": len(items), "imported": 0, "discarded": 0, "items": []}
         if not items:

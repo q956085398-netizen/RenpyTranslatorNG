@@ -374,3 +374,94 @@ def test_stats_reports_counts_for_reconciliation(store):
     assert st["confirmed"] == 1
     assert st["candidates"] == 1
     assert st["suggestions"] == 0
+
+
+# ---------- 编辑页状态读取（工单 09）：当前译文明细、待检查计数、忽略候选 ----------
+
+def test_current_records_expose_text_source_and_confirmed_flag(store):
+    """编辑页状态列需要每条当前译文的来源与确认位（currents 只给文本不够）。"""
+    store.sync_occurrences([rec(SAY_A), rec(SAY_B)])
+    store.record_model_result(SAY_A, "模型 A。")
+    store.set_human_translation(SAY_B, "人工 B。")
+    recs = store.current_records()
+    assert recs[SAY_A]["text"] == "模型 A。"
+    assert recs[SAY_A]["source"] == "model" and recs[SAY_A]["confirmed"] is False
+    assert recs[SAY_B]["text"] == "人工 B。"
+    assert recs[SAY_B]["source"] == "human" and recs[SAY_B]["confirmed"] is True
+
+
+def test_review_counts_group_pending_candidates_and_suggestions(store):
+    """待检查计数按出现位置分组：候选（重译/冲突/旧版本）与迁移建议分开计。"""
+    store.sync_occurrences([rec(SAY_A), rec(SAY_B), rec(STR_A, kind="string")])
+    store.set_human_translation(SAY_A, "人工 A。")
+    store.record_model_result(SAY_A, "冲突结果。")     # 人工确认 -> 候选
+    store.record_model_result(SAY_B, "模型 B。")
+    store.record_model_result(SAY_B, "模型 B 新。")    # 旧当前降为候选
+    store.set_human_translation(STR_A, "界面文本。")
+    # 源文本变化 -> 降级为迁移建议（其余出现位置照常在场，不受影响）
+    store.sync_occurrences([rec(SAY_A), rec(SAY_B),
+                            rec(STR_A, kind="string", text="改了。")])
+    counts = store.review_counts()
+    assert counts[SAY_A] == {"candidates": 1, "suggestions": 0}
+    assert counts[SAY_B] == {"candidates": 1, "suggestions": 0}
+    assert counts[STR_A] == {"candidates": 0, "suggestions": 1}
+
+
+def test_dismiss_candidate_removes_only_that_pending_result(store):
+    """忽略 = 删除一条已查看、决定不采用的候选/迁移建议；其余版本不受影响。"""
+    store.sync_occurrences([rec(SAY_A)])
+    store.set_human_translation(SAY_A, "人工定稿。")
+    store.record_model_result(SAY_A, "冲突结果一。")
+    store.record_model_result(SAY_A, "冲突结果二。")
+    cands = store.candidates(SAY_A)
+    assert len(cands) == 2
+    victim = next(c for c in cands if c["text"] == "冲突结果一。")
+    store.dismiss_candidate(SAY_A, victim["id"])
+    assert [c["text"] for c in store.candidates(SAY_A)] == ["冲突结果二。"]
+    # 当前译文不受忽略影响
+    assert store.get_current(SAY_A)["text"] == "人工定稿。"
+    # 迁移建议同样可忽略
+    store.sync_occurrences([rec(SAY_A, text="新文本。")])
+    sug = store.suggestions()[0]
+    store.dismiss_candidate(SAY_A, sug["id"])
+    assert [c["text"] for c in store.candidates(SAY_A)] == ["冲突结果二。"]
+    assert store.suggestions() == []
+
+
+def test_dismiss_candidate_rejects_current_translation(store):
+    """忽略入口不得作用于当前译文（删掉它会丢用户成果）。"""
+    store.sync_occurrences([rec(SAY_A)])
+    store.set_human_translation(SAY_A, "人工定稿。")
+    cur = store.get_current(SAY_A)
+    with pytest.raises(ValueError):
+        store.dismiss_candidate(SAY_A, cur["id"])
+    assert store.currents() == {SAY_A: "人工定稿。"}
+
+
+# ---------- 编辑会话原位改写与建议的范围查询（工单 09） ----------
+
+def test_rewrite_human_if_current_rewrites_only_claimed_session_state(store):
+    """会话内连续编辑原位改写；会话外/已被人接管的内容不走这条捷径。"""
+    store.sync_occurrences([rec(SAY_A), rec(SAY_B)])
+    store.set_human_translation(SAY_A, "人工一。")
+    assert store.rewrite_human_if_current(SAY_A, "人工一。", "人工二。") is True
+    cur = store.get_current(SAY_A)
+    assert cur["text"] == "人工二。" and cur["confirmed"] and cur["source"] == "human"
+    assert store.candidates(SAY_A) == []          # 原位改写不堆版本历史
+    # 期望文本已不是当前内容（其他写入方接管过）-> 拒绝原位改写
+    assert store.rewrite_human_if_current(SAY_A, "人工一。", "人工三。") is False
+    assert store.get_current(SAY_A)["text"] == "人工二。"
+    # 未确认的模型译文不适用原位改写（会话首次写入必须走标准入口）
+    store.record_model_result(SAY_B, "模型 B。")
+    assert store.rewrite_human_if_current(SAY_B, "模型 B。", "改写。") is False
+    assert store.get_current(SAY_B)["source"] == "model"
+
+
+def test_suggestions_scoped_to_one_occurrence(store):
+    store.sync_occurrences([rec(SAY_A), rec(SAY_B)])
+    store.set_human_translation(SAY_A, "A 的旧译文。")
+    store.set_human_translation(SAY_B, "B 的旧译文。")
+    store.sync_occurrences([rec(SAY_A, text="A 改了。"), rec(SAY_B, text="B 改了。")])
+    only_a = store.suggestions(SAY_A)
+    assert [s["text"] for s in only_a] == ["A 的旧译文。"]
+    assert len(store.suggestions()) == 2

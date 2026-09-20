@@ -129,6 +129,32 @@ def test_tool_side_draft_is_not_external_change(tmp_path, monkeypatch):
     assert s["external"] == {"detected": 0, "imported": 0, "discarded": 0}
 
 
+def test_unapplied_draft_before_first_apply_is_not_external_change(tmp_path, monkeypatch):
+    """首次应用前(无基线)编辑页保存了草稿:游戏 tl 停留在翻译步骤写入的旧值上
+    (旧值仍在项目库版本历史里),不误报为外部译文变更——工单 09 的编辑→应用
+    路径,检测参照补上"工具记录过的历史文本"(known_texts)。"""
+    from core import pipeline, tlgen
+    p, jobs = make_project(tmp_path, monkeypatch)
+    write_assets(p)
+    inject(p, jobs)
+    # 模拟翻译步骤的工具写入:把项目库当前译文回填进游戏 tl(尚未应用 -> 无基线)
+    text_map, key_map = pipeline._expand_translations(jobs, p.store().currents())
+    tl_files = sorted({os.path.join(p.game_base, "game", "tl", p.language, j["file"])
+                       for j in jobs if j.get("file")})
+    tlgen.fill_translations(tl_files, text_map, key_map)
+
+    key, old_text = applied(jobs, "The vale is quiet tonight.")
+    p.store().set_human_translation(key, "【编辑页草稿】夜很静。")   # 未应用的项目草稿
+    assert old_text in read(script_path(p))                        # tl 还停在旧值
+
+    items = externaltl.detect_changes(p.game_base, p.work, p.language, jobs,
+                                      known_texts=p.store().history_texts())["items"]
+    assert items == []
+    s = p.apply_txn(log=LOG, confirm=never)      # 首次应用不被自己的草稿打扰
+    assert "【编辑页草稿】夜很静。" in read(script_path(p))
+    assert s["external"] == {"detected": 0, "imported": 0, "discarded": 0}
+
+
 # ---------- 检测与阻止直接覆盖 ----------
 
 def test_external_edit_is_detected_and_blocks_apply(tmp_path, monkeypatch):

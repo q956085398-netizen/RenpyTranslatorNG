@@ -135,7 +135,8 @@ def _emit(items, **kw):
     items.append(kw)
 
 
-def detect_changes(game_base, work, language, jobs, draft_expected=None):
+def detect_changes(game_base, work, language, jobs, draft_expected=None,
+                   known_texts=None):
     """应用前检测外部译文变更，返回 {"items": [变更项…]}。
 
     jobs 是当前任务清单（tlgen.build_jobs 的输出，含 ipatch 覆盖），提供出现
@@ -144,7 +145,9 @@ def detect_changes(game_base, work, language, jobs, draft_expected=None):
     从未应用过（无基线）时以 draft_expected 为参照（pipeline 按"翻译/回填
     步骤实际写进游戏 tl 的内容"展开计算——第 5 步翻译会先把项目库译文回填进
     游戏 tl，那也是工具自身的写入），只报告任务清单内位置上的外部译文，
-    不推断文件级变更。
+    不推断文件级变更。known_texts（项目库记录过的全部译文文本，含被项目
+    草稿替换掉的旧版本）同样视为工具写入值：编辑页保存了草稿还没应用时，
+    游戏 tl 停留在上一个工具写入值上，那不是外部译文变更。
     """
     items = []
     tl_dir = os.path.join(game_base, "game", "tl", language)
@@ -226,13 +229,15 @@ def detect_changes(game_base, work, language, jobs, draft_expected=None):
                 # 从未应用过：以"翻译/回填步骤实际写入的内容"为参照，
                 # 只有任务清单里的位置可判定
                 drafts = draft_expected or {}
+                known = known_texts or {}
                 for key, info in scanned.items():
                     if key not in file_anchors:
                         continue
                     text = info["text"]
                     expected = drafts.get(key, file_anchors[key])
-                    if text == "" or text == file_anchors[key] or text == expected:
-                        continue    # 未译状态（原文/空行）或工具自身写入
+                    if (text == "" or text == file_anchors[key] or text == expected
+                            or text in known.get(key, ())):
+                        continue    # 未译状态（原文/空行）、工具自身写入或其历史版本
                     _emit(items, key=key, file=rel,
                           kind=KIND_ADDED if expected == file_anchors[key]
                           else KIND_MODIFIED,
