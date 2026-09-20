@@ -8,7 +8,8 @@
 
 1. **scan**：扫描 work/ 下的旧目录与两份应用文件，按目录名匹配游戏库里的
    游戏安装（config 的 last_game 作为补充候选），生成迁移预览：计数、匹配
-   状态、待检查项。
+   状态、待检查项。目录名是已登记项目身份但项目库尚未同步的过渡期目录
+   （译文仍只在旧镜像文件里）同样在列：安装关联直接来自注册库，不按名猜。
 2. **apply**：先自动创建备份（work/_migration_backup/<时间戳>/），再逐项目
    登记（并入已登记项目或新建）、拷贝项目资产、同步出现位置、导入译文
    （来源 migration）。每个项目的导入作为项目任务（kind=migrate）经协调器
@@ -45,8 +46,8 @@ from .util import write_json
 BACKUP_DIR_NAME = "_migration_backup"
 MARKER_NAME = "_migrated.json"
 
-# 旧 work/<目录名>/ 下的项目资产文件（translations.json 是派生镜像，由项目库
-# 重写生成，不在拷贝清单里）
+# 旧 work/<目录名>/ 下的项目资产文件（translations.json 不在清单里：译文经
+# import 进项目库，不再生成派生镜像文件——工单 10 收缩步骤）
 ASSET_JSON_FILES = ("dump.json", "jobs.json", "relations.json", "relation_words.json",
                     "glossary.json", "ipatch.json", "ipatch_skip.json")
 ASSET_DIRS = ("uipatch_backup",)
@@ -105,6 +106,15 @@ def _legacy_dirs():
         if os.path.isdir(os.path.join(work, n)):
             out.append((n, os.path.join(work, n)))
     return out
+
+
+def _store_synced(d):
+    """项目资产目录里的项目库是否已同步过出现位置（无库或空库返回 False）。
+
+    过渡期目录（工单 03–04 时代登记、项目库尚未建立或从未同步）的译文仍只在
+    旧镜像文件里，必须继续走迁移；项目库一旦同步过出现位置，旧镜像在其建立
+    过程中已尽数导入（import_currents 只补空位），该目录就是纯新式目录。"""
+    return project_store.ProjectStore(os.path.basename(d)).occurrence_count() > 0
 
 
 def _has_legacy_data(d):
@@ -226,11 +236,22 @@ def scan():
     if candidates:
         reg = registry.Registry()
         try:
-            reg_ids = {p["id"] for p in reg.projects()}
+            reg_by_id = {p["id"]: p for p in reg.projects()}
             for name, d in candidates:
-                if name in reg_ids or os.path.isfile(os.path.join(d, "project.db")):
-                    continue    # 已按项目身份存放的新式目录
-                projects.append(_scan_project(name, d, lib_index, last_game, reg))
+                registered = reg_by_id.get(name)
+                if registered is not None:
+                    # 过渡期目录（工单 03–04 时代）：按身份登记但项目库未同步，
+                    # 译文仍只在旧镜像文件里才需要迁移；没有镜像文件的已登记
+                    # 目录就是普通新式项目（项目库会在首次任务时同步），不打扰
+                    if (not os.path.isfile(os.path.join(d, "translations.json"))
+                            or _store_synced(d)):
+                        continue
+                elif _store_synced(d):
+                    continue    # 项目库已同步的新式目录（未登记但按身份存放）；
+                                # 未登记且未同步的目录按旧布局目录名匹配——只产
+                                # 生预览项，应用前有用户确认（迁移预览弹窗）兜底
+                projects.append(_scan_project(name, d, lib_index, last_game, reg,
+                                              registered=registered))
         finally:
             reg.close()
     return {"projects": projects, "review_items": review,
@@ -238,7 +259,7 @@ def scan():
             "config": {"ok": cfg_ok}}
 
 
-def _scan_project(name, d, lib_index, last_game, reg):
+def _scan_project(name, d, lib_index, last_game, reg, registered=None):
     trans = _translations_of(d)
     jobs, _err = _load_list(os.path.join(d, "jobs.json"))
     jobs = jobs or []
@@ -248,19 +269,27 @@ def _scan_project(name, d, lib_index, last_game, reg):
     records = _occurrence_records(dump, jobs)
     fingerprints = {r["occurrence_id"]: r["fingerprint"] for r in records}
 
-    cands = list(lib_index.get(name.lower(), []))
-    if last_game and os.path.basename(os.path.normpath(last_game)).lower() == name.lower():
-        p = os.path.normpath(last_game)
-        if p not in cands:
-            cands.append(p)
-    if not cands:
-        match = {"status": "missing", "install_path": None, "candidates": []}
-    elif len(cands) > 1:
-        match = {"status": "ambiguous", "install_path": None, "candidates": cands}
+    if registered is not None:
+        # 过渡期目录：身份与游戏安装关联已在注册库里，不需要（也绝不）按
+        # 目录名猜测匹配；当前安装已失效时与"找不到安装"同一待遇
+        install = registered.get("path")
+        match = ({"status": "merge", "install_path": install, "candidates": []}
+                 if install and os.path.isdir(install)
+                 else {"status": "missing", "install_path": None, "candidates": []})
     else:
-        install = cands[0]
-        status = "merge" if reg.find_by_path(install) is not None else "new"
-        match = {"status": status, "install_path": install, "candidates": []}
+        cands = list(lib_index.get(name.lower(), []))
+        if last_game and os.path.basename(os.path.normpath(last_game)).lower() == name.lower():
+            p = os.path.normpath(last_game)
+            if p not in cands:
+                cands.append(p)
+        if not cands:
+            match = {"status": "missing", "install_path": None, "candidates": []}
+        elif len(cands) > 1:
+            match = {"status": "ambiguous", "install_path": None, "candidates": cands}
+        else:
+            install = cands[0]
+            status = "merge" if reg.find_by_path(install) is not None else "new"
+            match = {"status": status, "install_path": install, "candidates": []}
 
     trans_source = os.path.join(d, "translations.json")
     items = []
@@ -486,23 +515,26 @@ def _import_project_data(p, pid, store, report, rb, _fail_at):
     store_dir = util.store_dir(pid)
 
     # 项目资产：只补缺，绝不覆盖目标里已有的文件（并入的新式项目可能已有
-    # 更新的提取结果）；被让位的旧文件仍在原目录，进待检查项说明
+    # 更新的提取结果）；被让位的旧文件仍在原目录，进待检查项说明。
+    # 过渡期目录（按身份存放、只是项目库未同步）本身就是项目资产目录，
+    # 源与目标相同，直接跳过拷贝
     _fail_point(_fail_at, "import:%s:assets" % name)
-    for fname in ASSET_JSON_FILES:
-        s = os.path.join(d, fname)
-        if not os.path.isfile(s):
-            continue
-        dst = os.path.join(store_dir, fname)
-        if os.path.exists(dst):
-            report["review_items"].append(_review(
-                fname, "", s, "项目资产目录已存在同名文件，保留了现有文件"
-                "（旧文件仍在原目录未动）"))
-        else:
-            shutil.copy2(s, dst)
-    for sub in ASSET_DIRS:
-        s = os.path.join(d, sub)
-        if os.path.isdir(s) and not os.path.exists(os.path.join(store_dir, sub)):
-            shutil.copytree(s, os.path.join(store_dir, sub))
+    if os.path.abspath(d) != os.path.abspath(store_dir):
+        for fname in ASSET_JSON_FILES:
+            s = os.path.join(d, fname)
+            if not os.path.isfile(s):
+                continue
+            dst = os.path.join(store_dir, fname)
+            if os.path.exists(dst):
+                report["review_items"].append(_review(
+                    fname, "", s, "项目资产目录已存在同名文件，保留了现有文件"
+                    "（旧文件仍在原目录未动）"))
+            else:
+                shutil.copy2(s, dst)
+        for sub in ASSET_DIRS:
+            s = os.path.join(d, sub)
+            if os.path.isdir(s) and not os.path.exists(os.path.join(store_dir, sub)):
+                shutil.copytree(s, os.path.join(store_dir, sub))
 
     # 出现位置：项目已有提取数据（新式提取）时不导入旧的出现位置，译文按
     # 指纹逐条对账；项目还没有数据时以旧提取结果打底（与新提取同构，
@@ -558,9 +590,9 @@ def _import_project_data(p, pid, store, report, rb, _fail_at):
         #（并发降级等极端情形），按保留计数，对账依然闭合
         t["kept"] += len(importable) - rep["imported"]
 
-    # 派生镜像 + 已迁移标记（标记在旧目录：数据原样保留，重复执行幂等）
+    # 已迁移标记（在旧目录：数据原样保留，重复执行幂等）。译文记录不再生成
+    # 派生镜像文件——项目库是唯一可信来源（工单 10 收缩步骤）
     _fail_point(_fail_at, "import:%s:marker" % name)
-    write_json(os.path.join(store_dir, "translations.json"), store.currents())
     marker = os.path.join(d, MARKER_NAME)
     write_json(marker, {"project_id": pid, "migrated_at": time.time(),
                         "translations": len(p["translations"])})

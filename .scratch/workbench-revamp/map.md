@@ -1,7 +1,9 @@
 # Map: workbench-revamp
 
 规格:`spec.md`(Status: ready-for-agent)
-范围:阶段 0(安全网)+ 阶段 1(可靠性基线)。阶段 2-4(UI 重组、视觉系统、发布能力)在 10 号票验收后另行切片,本图不含。
+范围:阶段 0(安全网)+ 阶段 1(可靠性基线)。阶段 0+1 已于 10 号票验收通过
+(结论:`docs/PHASE1-ACCEPTANCE.md`);阶段 2-4(UI 重组、视觉系统、发布能力)
+以其遗留事项为输入另行切片,本图不含。
 
 ## Tickets
 
@@ -16,7 +18,7 @@
 | 07 | 事务式应用与恢复 | resolved | 05, 06 |
 | 08 | 外部 tl 变更检测 | resolved | 07 |
 | 09 | 译文编辑页接入项目库 | resolved | 05, 06 |
-| 10 | 可靠性验收与回归全量接入 | ready-for-agent | 04, 08, 09 |
+| 10 | 可靠性验收与回归全量接入 | resolved | 04, 08, 09 |
 
 并行提示:01 完成后 02 与 03 可并行;05 完成后 06 → (07 ∥ 09) 可并行;07 → 08;10 汇聚全部。
 
@@ -24,6 +26,7 @@
 
 - 领域词汇与边界:根目录 `CONTEXT.md`
 - 架构决策:`docs/adr/0001`–`0005`
+- 阶段 0+1 验收结论与遗留事项(阶段 2 切片输入):`docs/PHASE1-ACCEPTANCE.md`
 - 完整计划与验收标准:`docs/PRODUCT-IMPROVEMENT-PLAN.md`
 - 合成回归夹具与引擎替身:`tests/fixtures/synthgames/`、`tests/syntheng.py`、
   `tests/stubserver.py`（05–09 的测试直接复用,菜单字幕走 strings 语义见 02 号票 Answer）
@@ -93,3 +96,12 @@
   顺带修复首次应用前未应用草稿被误报为外部译文变更(known_texts);
   6 项存储测试 + 1 项检测测试 + 4 项离屏对话框测试 + e2e 工单 09 段;
   答案见 `issues/09-….md` 的 Answer。10 号票的全部前置已满足。
+- 2026-09-20:10 已解决(可靠性验收与回归全量接入):**阶段 0+1 验收通过,
+  阶段 2(UI 重组)启动门打开**;验收结论/指标核对表/遗留事项见
+  `docs/PHASE1-ACCEPTANCE.md`(阶段 2 重新切片的直接输入)。五项成功指标
+  (串项目 0/覆盖人工 0/半应用 0/未提示覆盖 0/迁移对账率 100%)在 e2e 验收段
+  独立复算全部命中;迁移接入全链路(旧布局 + 过渡期目录两条进入路径,
+  迁移译文经项目库统一应用写进游戏 tl、幂等);旧 JSON 直读写路径移除
+  (translations.json/jobs.json 镜像的读写全删,历史数据只经 migration 进入
+  新存储,pystrings 软去重改走项目库);tests/ 改正规包 + e2e sys.exit 守卫,
+  一条命令 `pytest` 全量 119 项通过;答案见 `issues/10-….md` 的 Answer。

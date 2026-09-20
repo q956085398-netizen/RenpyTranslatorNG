@@ -17,8 +17,9 @@ core.util.store_dir）——项目包导出、迁移和删除都以项目为单�
   检查、应用），由 core.coordinator 项目任务协调器经同一连接入口读写——同一项目
   同一时间至多一个此类任务；翻译任务按记录事务逐批提交，不再整份覆盖派生镜像文件。
 
-写路径只有本模块；work/<项目身份>/translations.json 是旧版整份缓存文件，仅在新
-项目库首次启用时一次性导入（import_currents 只补空位），此后是派生的镜像文件。
+写路径只有本模块（工单 10 收缩步骤）：译文记录不再有整份镜像文件，运行时
+不读写 work/<项目身份>/translations.json；历史数据只经 core.migration 导入
+（import_currents 只补空位，供旧目录与过渡期目录的迁移使用）。
 """
 import hashlib
 import os
@@ -554,15 +555,42 @@ class ProjectStore:
         """清空全部未确认的当前译文记录（界面上「清空译文缓存」动作的库操作）。
 
         人工确认的译文是人工校对成果，按 ADR-0003 保留，不随清空丢失。
+        被清掉的未确认译文先整份写入项目资产目录下的恢复文件
+        （cleared_currents.<时间戳>.json）——高影响操作前留恢复点、绝不
+        静默丢弃（用户故事 19），需要时把内容按出现位置重新导入即可找回。
         返回保留的人工译文数。
         """
         with self._conn() as conn:
             kept = conn.execute("SELECT COUNT(*) AS n FROM translations"
                                 " WHERE status = ? AND confirmed = 1",
                                 (STATUS_CURRENT,)).fetchone()["n"]
+            rows = conn.execute(
+                "SELECT occurrence_id, text FROM translations"
+                " WHERE status = ? AND confirmed = 0", (STATUS_CURRENT,)).fetchall()
+            if rows:
+                backup = os.path.join(
+                    util.store_dir(self.project_id),
+                    "cleared_currents.%d.json" % int(time.time()))
+                util.write_json(backup, {r["occurrence_id"]: r["text"] for r in rows})
             conn.execute("DELETE FROM translations WHERE status = ?"
                          " AND confirmed = 0", (STATUS_CURRENT,))
         return kept
+
+    def occurrence_count(self):
+        """项目库里已同步的出现位置数（无库或库不可读为 0）。
+
+        迁移扫描用它区分"项目库尚未建立/同步的过渡期目录"与"纯新式目录"；
+        只读，不创建数据库。"""
+        if not os.path.isfile(self.path):
+            return 0
+        try:
+            conn = sqlite3.connect(self.path)
+            try:
+                return conn.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return 0        # 库损坏/被锁：按"未同步"处理，交给迁移流程（有备份兜底）
 
     def import_currents(self, mapping, source="import"):
         """旧版整份缓存（translations.json）一次性导入：只补空位，绝不覆盖。

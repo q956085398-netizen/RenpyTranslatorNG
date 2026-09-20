@@ -158,16 +158,57 @@ def test_scan_report_ambiguous_match_for_same_basename(app):
 
 
 def test_scan_skips_new_style_store_dirs_and_backup_dir(app, reg):
-    # 已注册项目按身份存放的目录不是旧数据
+    # 已注册项目按身份存放、项目库已同步出现位置的目录不是旧数据
     proj = reg.create_project("New", os.path.join(str(app), "g1"))
     store = util.store_dir(proj["id"])
     with open(os.path.join(store, "translations.json"), "w", encoding="utf-8") as f:
         json.dump({"S:New": "新"}, f)
+    project_store.ProjectStore(proj["id"]).sync_occurrences(
+        [project_store.record_from_job({"key": "S:New", "kind": "string",
+                                        "old": "New", "who": "",
+                                        "file": "screens.rpy"})])
     # 备份目录里即使有旧格式文件也不是待迁移项目
     bdir = os.path.join(str(app), "work", migration.BACKUP_DIR_NAME, "x", "Old-pc")
     os.makedirs(bdir)
     with open(os.path.join(bdir, "translations.json"), "w", encoding="utf-8") as f:
         json.dump({"k": "v"}, f)
+    assert migration.scan()["projects"] == []
+
+
+def test_scan_ignores_registered_dir_without_mirror_file(app, reg):
+    # 已登记但项目库未同步、也没有旧镜像文件的目录是普通新式项目：
+    # 没有只存在于镜像里的译文，迁移不打扰（项目库会在首次任务时同步）
+    install = os.path.join(str(app), "g2")
+    proj = reg.create_project("Plain", install)
+    d = util.store_dir(proj["id"])
+    with open(os.path.join(d, "dump.json"), "w", encoding="utf-8") as f:
+        json.dump({"blk_x": {"filename": "game/script.rpy", "lineno": 1,
+                             "nodes": []}}, f)
+    assert migration.scan()["projects"] == []
+
+
+def test_scan_and_apply_cover_transition_dir_registered_without_store(app, reg):
+    """过渡期目录（工单 03–04 时代）：已按身份登记、项目库从未同步，译文仍
+    只在旧镜像文件里——迁移照常导入（历史数据只经迁移进入新存储，工单 10），
+    游戏安装关联直接来自注册库，绝不按目录名匹配。"""
+    install = os.path.join(str(app), "games", GAME_NAME)
+    os.makedirs(install)
+    proj = registry.ensure_project(install, GAME_NAME, reg=reg)
+    make_legacy(app, name=proj["id"])   # 旧式数据放在按身份命名的目录里，无项目库
+
+    p = migration.scan()["projects"][0]
+    assert p["match"]["status"] == "merge"
+    assert p["match"]["install_path"] == install
+
+    report = migration.apply()
+    assert report["projects"]["merged"] == 1 and report["projects"]["created"] == 0
+    store = project_store.ProjectStore(proj["id"])
+    cur = store.currents()
+    assert cur["S:Leave"] == "离开" and len(cur) == 4
+    # 目录本身就是项目资产目录：不产生"同名文件让位"待检查项（源=目标跳过拷贝）
+    assert not any("同名文件" in i["detail"] for i in report["review_items"])
+    assert report["reconciled"] is True
+    # 幂等：项目库已同步，之后的扫描不再把它当待迁移目录
     assert migration.scan()["projects"] == []
 
 
@@ -220,7 +261,8 @@ def test_apply_registers_project_imports_assets_and_reconciles(app, reg):
     with open(os.path.join(new_store, "relations.json"), encoding="utf-8") as f:
         assert json.load(f) == REL
     assert os.path.isfile(os.path.join(new_store, "dump.json"))
-    assert os.path.isfile(os.path.join(new_store, "translations.json"))
+    # 译文记录不再生成派生镜像文件：项目库是唯一可信来源（工单 10）
+    assert not os.path.isfile(os.path.join(new_store, "translations.json"))
     # 旧数据原样保留，并留下已迁移标记
     with open(os.path.join(legacy, "translations.json"), encoding="utf-8") as f:
         assert json.load(f) == TRANS

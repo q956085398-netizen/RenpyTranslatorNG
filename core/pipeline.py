@@ -106,24 +106,10 @@ class Project:
         return [project_store.record_from_job(j) for j in jobs if j.get("old")]
 
     def ensure_store(self, jobs=None, log=None):
-        """项目库就绪供界面读写：同步出现位置（给了任务清单时）+ 导入旧缓存。"""
+        """项目库就绪供界面读写（给了任务清单时同步出现位置）。"""
         store = self.store()
         if jobs is not None:
             store.sync_occurrences(self._occurrence_records(jobs))
-        return self._import_legacy_cache(log)
-
-    def _import_legacy_cache(self, log=None):
-        """旧版整份译文缓存（translations.json）一次性导入项目库。
-
-        只补空位、绝不覆盖（含人工确认的当前译文）；此后该文件是项目库的
-        派生镜像，供 pystrings 软去重等读取方使用，不再是译文记录的写入方。
-        """
-        store = self.store()
-        legacy = read_json(os.path.join(self.work, "translations.json"), {}) or {}
-        rep = store.import_currents(legacy)
-        if rep["imported"] and log:
-            log("已导入旧版译文缓存 %d 条进项目库（只补空位，已有译文与人工确认的"
-                "译文不受影响）" % rep["imported"])
         return store
 
     def _seed_translations(self, store):
@@ -135,21 +121,20 @@ class Project:
             seed.pop(oid, None)
         return seed
 
-    def _prepare_translation_run(self, log, jobs, trans_path, store):
-        """翻译/重译共用的准备：作废失效的补丁缓存，刷新一次派生镜像，返回种子。
+    def _prepare_translation_run(self, log, jobs, store):
+        """翻译/重译共用的准备：作废失效的补丁缓存，返回种子。
 
         种子直接取自项目库（断点续翻与同文去重的依据）。模型结果按记录事务
-        逐批提交进项目库，任务运行期间不再整份写镜像文件；开跑前与结束后的
-        两次整份刷新只是派生镜像与项目库对账——进程中断后镜像最多滞后到上次
-        刷新，项目库始终是可信来源，下次导入/翻译自然修复。"""
-        self._drop_stale_overlay_cache(log, jobs, trans_path, store)
-        write_json(trans_path, store.currents())
+        逐批提交进项目库；译文记录不再有整份镜像文件——项目库是唯一可信
+        来源（工单 10 收缩步骤：运行时不读写 translations.json，历史数据只经
+        core.migration 进入项目库）。"""
+        self._drop_stale_overlay_cache(log, jobs, store)
         return self._seed_translations(store)
 
-    def _drop_stale_overlay_cache(self, log, jobs, trans_path, store):
+    def _drop_stale_overlay_cache(self, log, jobs, store):
         if not self._ov:
             return
-        stale = ipatch.drop_stale_cache(jobs, self._ov, trans_path, log=log)
+        stale = ipatch.stale_overlay_keys(jobs, self._ov, self.work, log=log)
         if not stale:
             return
         dropped, protected = store.drop_currents(stale)
@@ -200,11 +185,14 @@ class Project:
         # ipatch 台词补丁：先解析（替换对/节点改写/补丁自有文本）
         ov = ipatch.build_overlay(self.game_base, self.work, log=log, save=True)
         # 补提取：官方机制看不到的 Python 字面量（数据驱动型游戏的界面文本）；
-        # 补丁自有文本（输入提示词等）一并并入补充骨架
+        # 补丁自有文本（输入提示词等）一并并入补充骨架。软去重的"已有译文"
+        # 参照直接取自项目库（S: 出现位置的当前译文，工单 10：不再读镜像文件）
         try:
-            added = pystrings.write_skeleton(self.game_base, self.work, self.language,
+            known = {k[2:] for k in self.store().currents() if k.startswith("S:")}
+            added = pystrings.write_skeleton(self.game_base, self.language,
                                              dump_path=json_path, log=log,
-                                             extra=(ov.extra if ov else None))
+                                             extra=(ov.extra if ov else None),
+                                             known=known)
             if added:
                 log("补提取 Python 字符串 %d 条（写入 tl 补充骨架，与官方提取互不影响）" % added)
         except Exception:
@@ -252,7 +240,7 @@ class Project:
         log("关系草表已生成：%d 个角色（请到“人物关系”页检查修正）" % len(chars))
         return chars
 
-    def _jobs(self, log, context_override=None, persist=True):
+    def _jobs(self, log, context_override=None):
         dump = self.load_dump()
         ctx = int(self.cfg["engine"].get("context_lines", 2))
         if context_override is not None:
@@ -269,17 +257,15 @@ class Project:
             n = ipatch.overlay_jobs(jobs, self._ov)
             if n:
                 log("ipatch 补丁覆盖：%d 条翻译源已替换为补丁后文本（译文仍按原文写回 tl）" % n)
-        # 同步是幂等的事务写（浏览路径也走这里：旧格式缓存导入与降级建议都
-        # 依赖出现位置在库；任务运行期间 dump 不变，同步不产生冲突写）
+        # 同步是幂等的事务写（浏览路径也走这里：降级建议依赖出现位置在库；
+        # 任务运行期间 dump 不变，同步不产生冲突写）。任务清单不再落
+        # jobs.json 镜像——编辑页从当前提取结果重建（工单 09），运行时没有
+        # 任何读取方（工单 10 收缩步骤）
         self.store().sync_occurrences(self._occurrence_records(jobs))
         if not self.cfg.get("translate_strings", True):
             # 任务范围不含 strings(strings 文件仍在暂存集里随应用统一替换,
             # 只是不回填——回填过滤见 _fillable_files)
             jobs = [j for j in jobs if j["kind"] != "string"]
-        if persist:
-            # 派生镜像（jobs.json）：任务路径写；编辑页浏览路径不写——项目任务
-            # 运行期间不再让第二个写入方碰它（工单 06 的纪律）
-            write_json(os.path.join(self.work, "jobs.json"), jobs)
         return jobs, tl_files
 
     def _fillable_files(self, tl_files, jobs):
@@ -308,8 +294,8 @@ class Project:
           显式批量操作的影响范围）。
         """
         log = log or (lambda m: None)
-        jobs, _tl_files = self._jobs(log, persist=False)
-        store = self._import_legacy_cache(log)
+        jobs, _tl_files = self._jobs(log)
+        store = self.store()
         currents = store.current_records()
         reviews = store.review_counts()
         same_source = {}
@@ -333,7 +319,7 @@ class Project:
 
     def estimate(self, log):
         jobs, _ = self._jobs(log)
-        store = self._import_legacy_cache(log)
+        store = self.store()
         text_map, _key_map = _expand_translations(jobs, store.currents())
         chars = sum(len(j["old"]) for j in jobs)
         done = sum(1 for j in jobs if j["old"] and (j.get("orig") or j["old"]) in text_map)
@@ -343,9 +329,8 @@ class Project:
     def translate(self, log, progress=None, should_stop=None):
         t0 = time.monotonic()
         jobs, tl_files = self._jobs(log)
-        trans_path = os.path.join(self.work, "translations.json")
-        store = self._import_legacy_cache(log)
-        seed = self._prepare_translation_run(log, jobs, trans_path, store)
+        store = self.store()
+        seed = self._prepare_translation_run(log, jobs, store)
         prior, _prior_keys = _expand_translations(jobs, seed)
         done0 = sum(1 for j in jobs if j["old"] and (j.get("orig") or j["old"]) in prior)
         if done0:
@@ -369,8 +354,6 @@ class Project:
                 log("    …其余 %d 条" % (len(dropped) - 3))
             log("    多出的变量名改对（或删掉）后重跑本步即可回填；译文记录保存在项目库中")
         log("⏱ 翻译总用时：%s" % _fmt_duration(time.monotonic() - t0))
-        # 派生镜像整份刷新（任务期间不再整份覆盖；pystrings 软去重等读取方沿用）
-        write_json(trans_path, store.currents())
         return n, missing
 
     def retranslate_missing(self, log, progress=None, should_stop=None):
@@ -378,9 +361,8 @@ class Project:
         请求只包含未译内容，每句至多附前后各 1 句上下文；已译内容绝不重复请求，
         人工确认的译文也绝不重新请求（除非对该条发起重译请求）。"""
         jobs, tl_files = self._jobs(log, context_override=1)
-        trans_path = os.path.join(self.work, "translations.json")
-        store = self._import_legacy_cache(log)
-        seed = self._prepare_translation_run(log, jobs, trans_path, store)
+        store = self.store()
+        seed = self._prepare_translation_run(log, jobs, store)
         prior, _km = _expand_translations(jobs, seed)
         missing = [j for j in jobs if j["old"] and (j.get("orig") or j["old"]) not in prior]
         if not missing:
@@ -398,7 +380,6 @@ class Project:
                           and (j.get("orig") or j["old"]) not in text_map)
         log("回填 %d 条译文，剩余未译 %d 条（可再次执行本步继续修复）" % (n, missing_after))
         log("⏱ 重译总用时：%s" % _fmt_duration(time.monotonic() - t0))
-        write_json(trans_path, store.currents())
         return n, missing_after
 
     @staticmethod
@@ -520,7 +501,7 @@ class Project:
         导入(人工来源)/放弃(清单留痕)/中止;成功后基线自动更新。
         """
         jobs, tl_files = self._jobs(log)
-        store = self._import_legacy_cache(log)
+        store = self.store()
         ext = self._resolve_external_changes(log, store, jobs, confirm)
         if ext is None:
             return {"stopped": True}
@@ -584,7 +565,7 @@ class Project:
         修不掉、但会让游戏在渲染时抛 Unknown text tag 的写法（未知标签名、用 ':' 传参）
         单独报出来——这类错误引擎 lint 看不出来，只能在这里拦。
         """
-        store = self._import_legacy_cache()
+        store = self.store()
         trans = store.currents()
         n = 0
         bad = []
@@ -598,8 +579,6 @@ class Project:
                 n += 1
             for why in texttags.problems(fixed):
                 bad.append((k, why, fixed))
-        if n:
-            write_json(os.path.join(self.work, "translations.json"), trans)
         log("标签修复完成：共 %d 条译文被修正（剩余 %d 条正常）" % (n, len(trans) - n))
         if bad:
             log("⚠ 仍有 %d 条译文的文本标签会在运行时崩溃，建议用 setline 逐条修（前 %d 条）："

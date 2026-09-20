@@ -290,12 +290,13 @@ def _collect_tl_olds(game_base, language):
     return olds
 
 
-def _collect_skip(dump_path, data_dir):
-    """软去重集合：对白 dump 里的台词、译文缓存里已存在的条目。
+def _collect_skip(dump_path, known):
+    """软去重集合：对白 dump 里的台词、项目库里已有译文的 strings 文本。
 
     与这些重复的文本默认不收，但赋值/notify/return 行（运行期动态显示的数据）
     仍放行进 strings 表。官方 tl 已定义的 old 不在此列——那是硬约束，
-    由 _collect_tl_olds 单独处理。"""
+    由 _collect_tl_olds 单独处理。known 由调用方取自项目库（S: 出现位置的
+    当前译文文本）——译文记录不再落镜像文件（工单 10）。"""
     skip = set()
     if dump_path and os.path.isfile(dump_path):
         try:
@@ -310,24 +311,16 @@ def _collect_skip(dump_path, data_dir):
                     # 构建菜单，同样的文本运行期走 strings 表，必须收录
         except Exception:
             pass
-    cache = os.path.join(data_dir, "translations.json")
-    if os.path.isfile(cache):
-        try:
-            with open(cache, "r", encoding="utf-8") as f:
-                for k in json.load(f):
-                    if k.startswith("S:"):
-                        skip.add(k[2:])
-        except Exception:
-            pass
+    skip.update(s for s in known or () if s)
     return skip
 
 
-def scan_strings(game_base, data_dir, dump_path=None, language="chinese"):
+def scan_strings(game_base, dump_path=None, language="chinese", known=()):
     """扫描源码，返回按首次出现顺序去重的候选原文列表。
 
-    data_dir：汉化项目的项目资产目录（读取既有译文做软去重）。"""
+    known：项目库里已有译文的 strings 文本（软去重参照，取自 ProjectStore）。"""
     gamedir = os.path.join(game_base, "game")
-    skip = _collect_skip(dump_path, data_dir)
+    skip = _collect_skip(dump_path, known)
     tl_olds = _collect_tl_olds(game_base, language)
     seen = set()
     out = []
@@ -368,7 +361,7 @@ def scan_strings(game_base, data_dir, dump_path=None, language="chinese"):
                             seen.add(frag)
                             out.append(frag)
                     continue
-                # 已在任一 tl old 表 / dump / 译文缓存里的不再收（去重靠 skip 集合）。
+                # 已在任一 tl old 表 / dump / 项目库已有译文的不再收（去重靠 skip 集合）。
                 # 注意：_() 包装的字符串也要收（官方提取基于原始 rpyc，看不到包装）；
                 # 属性/变量赋值行里的字符串是运行期动态显示的数据
                 # （如 self.orgasm_text = "Aaaggghhhh!!"），即使与某句对白相同也要进 strings 表
@@ -380,7 +373,7 @@ def scan_strings(game_base, data_dir, dump_path=None, language="chinese"):
                 # 且官方条目就在译文表里，运行期查表照样生效——赋值/notify 行也不放行
                 if val in tl_olds:
                     continue
-                # 与对白 dump/译文缓存重复的文本，仅当出现在赋值/notify/return 行
+                # 与对白 dump/已有译文的 strings 重复的文本，仅当出现在赋值/notify/return 行
                 # （运行期动态显示的数据）时仍要进 strings 表
                 if val in skip and not _EXTRACT_LINE.match(line) \
                         and not _ASSIGN_LINE.match(line):
@@ -403,17 +396,18 @@ def _write_runtime_filter(game_base):
         f.write(_RUNTIME_RPY)
 
 
-def write_skeleton(game_base, data_dir, language, dump_path=None, log=print, extra=None):
+def write_skeleton(game_base, language, dump_path=None, log=print, extra=None,
+                   known=()):
     """生成/合并补充骨架与运行时过滤器，返回本次新增条数。
 
-    data_dir：汉化项目的项目资产目录（读取既有译文做软去重）。
+    known：项目库里已有译文的 strings 文本（软去重参照，取自 ProjectStore）。
     extra：ipatch 补丁自有的玩家可见文本（输入提示词等），游戏源码里没有
     对应字面量，必须由调用方显式并入骨架一起翻译。
 
     重写时顺带自愈：剔除骨架里与官方 tl 重复定义的 old（会让 Ren'Py
     启动即崩）及骨架自身重复的条目，因此旧版本生成的坏文件重跑即可修复。
     """
-    found = scan_strings(game_base, data_dir, dump_path, language)
+    found = scan_strings(game_base, dump_path, language, known=known)
     if extra:
         have_f = set(found)
         for s in extra:

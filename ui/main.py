@@ -962,7 +962,6 @@ class MainWindow(QMainWindow):
         self._edit_rows = None       # 编辑页数据：每个文本出现位置一行（pipeline.editor_rows）
         self._edit_shown = []        # 当前表格里实际显示的行（_edit_rows 的引用子集）
         self._edit_store = None
-        self._edit_path = ""
         self._edit_kw = ""
         self.setWindowTitle("RenpyTranslatorNG — Ren'Py 游戏汉化工具")
         self.resize(1180, 780)
@@ -1411,7 +1410,6 @@ class MainWindow(QMainWindow):
             return False
         self._edit_rows = rows
         self._edit_store = p.store()
-        self._edit_path = os.path.join(p.work, "translations.json")
         done = sum(1 for r in rows if r["trans"])
         review = sum(1 for r in rows if r["candidates"] or r["suggestions"])
         self.lb_search.setText("已载入 %d 个出现位置：已译 %d、未译 %d、待检查 %d。"
@@ -1514,18 +1512,6 @@ class MainWindow(QMainWindow):
         dlg = EditTranslationDialog(self._edit_store, row, siblings,
                                     on_saved=self._edit_autosaved, parent=self)
         dlg.exec()
-        if dlg.saved_keys:
-            # 对话框内的写动作已即时落库；派生镜像在此统一刷新一次
-            self._edit_sync_mirror()
-
-    def _edit_sync_mirror(self):
-        """编辑页写动作之后刷新派生镜像 translations.json（读取方沿用，工单 05）。"""
-        if self._edit_store is None:
-            return
-        try:
-            write_json(self._edit_path, self._edit_store.currents())
-        except Exception:
-            pass    # 镜像滞后无害：项目库是可信来源，下次任务开跑前会整份对账
 
     def _edit_autosaved(self, keys):
         """编辑对话框写动作的回执：刷新受影响行与保存状态（不整页重建）。
@@ -1581,7 +1567,6 @@ class MainWindow(QMainWindow):
         for r in hits:
             self._edit_store.set_human_translation(r["key"], _ci_replace(r["trans"], kw, repl))
         self._edit_autosaved([r["key"] for r in hits])
-        self._edit_sync_mirror()
         self._toast("已替换 %d 条译文并保存为项目草稿" % len(hits))
 
     def _edit_fix_tags(self):
@@ -2271,16 +2256,15 @@ class MainWindow(QMainWindow):
             self._toast("有项目任务正在运行，请等它结束后再清空译文缓存")
             return
         store = p.store()
-        has_cache = bool(store.currents()) or os.path.isfile(
-            os.path.join(p.work, "translations.json"))
-        if not has_cache:
-            self._toast("当前游戏没有译文缓存")
+        if not store.currents():
+            self._toast("当前游戏没有译文记录")
             return
         ret = QMessageBox.question(
             self,
             "确认清空译文缓存",
-            "即将清空全部未确认的本地译文记录（旧文件备份为 translations.json.bak）。\n"
+            "即将清空项目数据库里全部未确认的译文记录。\n"
             "人工确认过的译文会保留，不会被清空。\n"
+            "被清掉的译文先备份到项目资产目录（cleared_currents.*.json），可找回。\n"
             "重跑第5步会重新翻译未确认的内容。\n\n"
             "确定要继续吗？",
             QMessageBox.Yes | QMessageBox.No,
@@ -2289,13 +2273,10 @@ class MainWindow(QMainWindow):
         if ret != QMessageBox.Yes:
             return
         kept = store.clear_currents()
-        path = os.path.join(p.work, "translations.json")
-        if os.path.isfile(path):
-            os.replace(path, path + ".bak")
         if kept:
-            self._toast("译文缓存已清空；%d 条人工确认的译文已保留，重跑第5步即重译其余内容" % kept)
+            self._toast("译文记录已清空（已备份）；%d 条人工确认的译文已保留，重跑第5步即重译其余内容" % kept)
         else:
-            self._toast("译文缓存已清空（备份为 translations.json.bak），重跑第5步即全文重译")
+            self._toast("译文记录已清空（已备份），重跑第5步即全文重译")
 
     def _open_apply_points(self):
         """恢复点 / 停用汉化（工单 07）：需要已登记的项目与游戏目录。"""

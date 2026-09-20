@@ -225,18 +225,16 @@ if ov:
     check("strings old unchanged", 'old "Landlady day"' in out)
     check("strings new = patched translation", 'new "译(Mom day)"' in out)
 
-    # 缓存失效：首次（无 sig）应丢弃打过补丁的 key
-    trans_path = os.path.join(tmp, "work", "translations.json")
-    os.makedirs(os.path.dirname(trans_path), exist_ok=True)
-    json.dump(trans, open(trans_path, "w", encoding="utf-8"), ensure_ascii=False)
-    dropped = ipatch.drop_stale_cache(jobs, ov, trans_path, log=print)
-    left = json.load(open(trans_path, encoding="utf-8"))
-    check("stale dropped", dropped and len(left) == 0, "left=%d" % len(left))
-    # 第二次：sig 已存，不再丢弃
-    json.dump(trans, open(trans_path, "w", encoding="utf-8"), ensure_ascii=False)
-    dropped2 = ipatch.drop_stale_cache(jobs, ov, trans_path, log=print)
-    left2 = json.load(open(trans_path, encoding="utf-8"))
-    check("second run keeps cache", not dropped2 and len(left2) == 2, "left=%d" % len(left2))
+    # 补丁变化失效：stale_overlay_keys 报告受影响 key（作废本身走项目库，
+    # pipeline 接 store.drop_currents；未确认译文降级候选/人工译文保护语义
+    # 见 test_project_store 的 drop_currents 用例）
+    stale = ipatch.stale_overlay_keys(jobs, ov, WORK, log=print)
+    check("stale keys reported",
+          sorted(stale) == sorted(j["key"] for j in jobs if j.get("orig")),
+          repr(stale))
+    # 第二次：指纹已存，不再报告
+    dropped2 = ipatch.stale_overlay_keys(jobs, ov, WORK, log=print)
+    check("second run keeps cache", not dropped2, repr(dropped2))
 
 # pystrings 扫描必须跳过补丁文件，但名字带 patch 的普通脚本要照常扫描
 check("pystrings skips patch, keeps storypatch",
@@ -247,7 +245,7 @@ check("storypatch 不误判为补丁",
       not ipatch.is_patch_file(os.path.join(gamedir, "storypatch.rpy")))
 
 # write_skeleton 接收补丁自有文本（输入提示词）并并入骨架；运行时文件含 input 包装
-added = pystrings.write_skeleton(game, WORK, "chinese", extra=["(default is Sister).", "(default is Sister)."])
+added = pystrings.write_skeleton(game, "chinese", extra=["(default is Sister).", "(default is Sister)."])
 skel = open(os.path.join(gamedir, "tl", "chinese", "zz_ng_pystrings.rpy"), encoding="utf-8").read()
 check("extra merged once", added >= 1 and skel.count('old "(default is Sister)."') == 1)
 rt = open(os.path.join(gamedir, "zz_ng_dyntrans.rpy"), encoding="utf-8").read()

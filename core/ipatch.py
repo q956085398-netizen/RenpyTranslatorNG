@@ -458,21 +458,25 @@ def overlay_jobs(jobs, ov):
     return n
 
 
-def drop_stale_cache(jobs, ov, trans_path, log=print):
-    """补丁内容变化后使受影响的译文缓存失效。
+def stale_overlay_keys(jobs, ov, work_dir, log=print):
+    """补丁内容变化后报告需要作废的译文出现位置（并记录新指纹，幂等）。
 
-    缓存按任务 key 存译文，key 不含文本内容；补丁改动会改变翻译源文本，
-    因此补丁指纹变化时，所有"源文本被补丁改过"（orig != old）的任务的缓存
-    全部作废重译。源文本未被补丁改过的任务不受影响，照常断点续翻。
-    返回作废的任务 key 列表（无变化返回空列表）。"""
+    译文缓存按出现位置存进项目库（key 不含文本内容）；补丁改动会改变翻译
+    源文本，因此补丁指纹变化时，所有"源文本被补丁改过"（orig != old）的
+    任务的译文都要作废重译。源文本未被补丁改过的任务不受影响，照常断点续翻。
+
+    本函数只比对补丁指纹、记录新指纹并返回应作废的任务 key 列表（无变化
+    返回空列表）；项目库侧的作废（未确认译文降级候选、人工译文保护）由调用
+    方经 ProjectStore.drop_currents 完成——译文记录不再有整份镜像文件可删
+    （工单 10 收缩步骤）。"""
     if ov is None:
         # 补丁文件被移除：之前按补丁文本翻译的缓存无法逐条定位，只能提示
-        sig_path = os.path.join(work_dir_from(trans_path), "ipatch_sig")
+        sig_path = os.path.join(work_dir, "ipatch_sig")
         if os.path.isfile(sig_path):
             log("注意：游戏的 ipatch 补丁已被移除。之前按补丁后文本翻译的缓存"
                 "不会自动失效，如需完全按未打补丁的原文重译，请清空译文缓存后重翻")
         return []
-    sig_path = os.path.join(work_dir_from(trans_path), "ipatch_sig")
+    sig_path = os.path.join(work_dir, "ipatch_sig")
     prev = None
     if os.path.isfile(sig_path):
         try:
@@ -482,27 +486,16 @@ def drop_stale_cache(jobs, ov, trans_path, log=print):
             prev = None
     if prev == ov.sig:
         return []
-    stale = {j["key"] for j in jobs if j.get("orig") and j["orig"] != j["old"]}
+    stale = sorted(j["key"] for j in jobs if j.get("orig") and j["orig"] != j["old"])
     if stale:
-        trans = read_json(trans_path, {}) or {}
-        dropped = [k for k in stale if k in trans]
-        for k in dropped:
-            del trans[k]
-        if dropped:
-            write_json(trans_path, trans)
-            log("ipatch 补丁状态变化：%d 条相关译文缓存已作废，将按补丁后文本重译"
-                % len(dropped))
+        log("ipatch 补丁状态变化：%d 条相关译文将作废，按补丁后文本重译" % len(stale))
     try:
         os.makedirs(os.path.dirname(sig_path) or ".", exist_ok=True)
         with open(sig_path, "w", encoding="utf-8") as f:
             f.write(ov.sig)
     except OSError:
         pass
-    return dropped
-
-
-def work_dir_from(trans_path):
-    return os.path.dirname(os.path.abspath(trans_path))
+    return stale
 
 
 def _fmt_exc():

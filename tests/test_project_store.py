@@ -329,6 +329,24 @@ def test_clear_currents_keeps_confirmed_human_translations(store):
     assert store.currents() == {SAY_B: "人工 B。"}
 
 
+def test_clear_currents_backs_up_cleared_records_first(store):
+    """清空前的恢复点（用户故事 19）：被清掉的未确认译文整份备份到项目资产
+    目录，人工确认的译文不进备份（它们本来就保留在库里）。"""
+    import glob
+    store.sync_occurrences([rec(SAY_A), rec(SAY_B)])
+    store.record_model_result(SAY_A, "模型 A。")
+    store.set_human_translation(SAY_B, "人工 B。")
+    store.clear_currents()
+    backups = glob.glob(os.path.join(util.store_dir(store.project_id),
+                                     "cleared_currents.*.json"))
+    assert len(backups) == 1
+    assert util.read_json(backups[0]) == {SAY_A: "模型 A。"}
+    # 没有可清内容时不产生备份文件
+    store.clear_currents()
+    assert len(glob.glob(os.path.join(util.store_dir(store.project_id),
+                                      "cleared_currents.*.json"))) == 1
+
+
 # ---------- 旧缓存导入：只补空位，绝不覆盖 ----------
 
 def test_import_currents_fills_only_missing_occurrences(store):

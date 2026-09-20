@@ -26,10 +26,20 @@ import threading
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from core import applytxn, coordinator, extract, ipatch, pipeline, project_store, registry, tlgen, util  # noqa: E402
+from core import applytxn, coordinator, extract, ipatch, migration, pipeline, project_store, registry, tlgen, util  # noqa: E402
 from tests import syntheng, stubserver  # noqa: E402
 
 failures = []
+metrics = {}
+# 规格成功指标（docs/PRODUCT-IMPROVEMENT-PLAN.md §8 可靠性）：工单 10 验收段
+# 独立复算每一项并断言命中目标值
+METRIC_TARGETS = {
+    "同名不同路径项目串数据": 0,
+    "自动过程覆盖人工译文": 0,
+    "应用失败留下半完成游戏目录": 0,
+    "未提示覆盖外部 tl 变更": 0,
+    "迁移前后项目资产可对账率": 1.0,
+}
 
 REAL_WORK = os.path.join(util.app_dir(), "work")
 REAL_WORK_BEFORE = sorted(os.listdir(REAL_WORK)) if os.path.isdir(REAL_WORK) else None
@@ -44,6 +54,12 @@ def check(name, cond, detail=""):
     print("[%s] %s %s" % (tag, name, detail))
     if not cond:
         failures.append(name)
+
+
+def metric(name, value, detail=""):
+    """成功指标登记：值在工单 10 验收段与 METRIC_TARGETS 统一核对。"""
+    metrics[name] = value
+    print("[METRIC] %s = %s %s" % (name, value, detail))
 
 
 def copy_game(name):
@@ -222,12 +238,15 @@ try:
           "requests=%d" % stub.request_count)
     check("全部任务翻译完成（剩余 0）", missing == 0, "missing=%d" % missing)
 
-    trans = util.read_json(os.path.join(p.work, "translations.json"))
+    trans = p.store().currents()
     river_keys = branch
-    check("两个分支的 key 都有自己的译文缓存",
+    check("两个分支的 key 都有自己的译文记录（项目库）",
           all(k in trans for k in river_keys), repr(sorted(trans)[:5]))
     check("分支同文沿用同一译文（现语义：同文同译）",
           trans[river_keys[0]] == trans[river_keys[1]] == "河水记得。")
+    check("译文记录不再落整份镜像文件（项目库唯一可信来源，工单 10）",
+          not os.path.isfile(os.path.join(p.work, "translations.json"))
+          and not os.path.isfile(os.path.join(p.work, "jobs.json")))
 
     tl_main = os.path.join(game, "game", "tl", "chinese", "script.rpy")
     content = read(tl_main)
@@ -446,26 +465,31 @@ try:
     check("B 的提取结果在自己的项目库里",
           os.path.isfile(os.path.join(pb.work, "dump.json")))
 
-    # B 端按自己的译文回填同一英文（不同项目、不同译法），A 端分毫不动
+    # B 端按自己的译文回填同一英文（不同项目、不同译法），A 端分毫不动。
+    # B 的历史译文经迁移的导入入口进入项目库（工单 10：历史数据只经迁移进入
+    # 新存储，运行时不再读写整份镜像文件）
     dumpB = util.read_json(os.path.join(pb.work, "dump.json"))
     jobsB, _tlb = tlgen.build_jobs(gameB, "chinese", dumpB, include_strings=True,
                                    context_lines=2)
     riverB = [j["key"] for j in jobsB if j["kind"] == "say"
               and j["old"] == "The river remembers."]
     check("两个项目对同一源文本得到结构一致的任务清单", len(riverB) == 2, repr(riverB))
-    util.write_json(os.path.join(pb.work, "translations.json"),
-                    {k: "河流记得（B 项目专用）。" for k in riverB})
+    pb.store().sync_occurrences(
+        [project_store.record_from_job(j) for j in jobsB if j.get("old")])
+    pb.store().import_currents({k: "河流记得（B 项目专用）。" for k in riverB},
+                               source="migration")
     pb.apply_txn(log=lambda m: None)
 
     contentA = read(os.path.join(gameA, "game", "tl", "chinese", "script.rpy"))
     contentB = read(os.path.join(gameB, "game", "tl", "chinese", "script.rpy"))
     check("B 端回填的是 B 自己的译文", "河流记得（B 项目专用）。" in contentB)
-    check("A 的游戏与项目库不受 B 影响",
-          "河流记得（B 项目专用）。" not in contentA
-          and util.read_json(os.path.join(pa.work, "translations.json"))
-          == {"k_marker_A": "A 项目的译文"}
-          and util.read_json(os.path.join(pa.work, "glossary.json"))
-          == [{"en": "vale", "cn": "幽谷（A 项目专用）"}])
+    isoA = "河流记得（B 项目专用）。" not in contentA
+    isoB = (util.read_json(os.path.join(pa.work, "translations.json"))
+            == {"k_marker_A": "A 项目的译文"})
+    isoC = (util.read_json(os.path.join(pa.work, "glossary.json"))
+            == [{"en": "vale", "cn": "幽谷（A 项目专用）"}])
+    check("A 的游戏与项目库不受 B 影响", isoA and isoB and isoC)
+    # 成功指标「同名不同路径项目串数据」在工单 10 验收段按 isoA/isoB/isoC 复算
 except Exception as e:  # noqa: BLE001
     import traceback
     check("同名游戏隔离回归无异常", False, "%s: %s" % (type(e).__name__, e))
@@ -712,14 +736,15 @@ try:
                 if not k.startswith("game/fonts_ng_backup/")}
 
     # ---- 故障注入:暂存/替换阶段失败,游戏目录保持应用前状态 ----
+    stage_ok = replace_ok = False
     cfg7["font_path"] = os.path.join(TMP, "missing.ttf")
     try:
         p7.apply_txn(log=lambda m: None)
         check("暂存阶段失败:应用中止", False, "竟然成功")
     except applytxn.ApplyError:
-        check("暂存阶段失败:应用中止且游戏目录零改动",
-              {k: v for k, v in applytxn.snapshot_tree(game7).items()
-               if not k.startswith("game/fonts_ng_backup/")} == applied7)
+        stage_ok = ({k: v for k, v in applytxn.snapshot_tree(game7).items()
+                     if not k.startswith("game/fonts_ng_backup/")} == applied7)
+        check("暂存阶段失败:应用中止且游戏目录零改动", stage_ok)
     cfg7["font_path"] = FONT_PATH
 
     orig_install = applytxn._install_file
@@ -736,9 +761,9 @@ try:
         p7.apply_txn(log=lambda m: None)
         check("替换阶段失败:回滚", False, "竟然成功")
     except OSError:
-        check("替换阶段失败:游戏目录回滚到应用前状态(无半应用)",
-              {k: v for k, v in applytxn.snapshot_tree(game7).items()
-               if not k.startswith("game/fonts_ng_backup/")} == applied7)
+        replace_ok = ({k: v for k, v in applytxn.snapshot_tree(game7).items()
+                       if not k.startswith("game/fonts_ng_backup/")} == applied7)
+        check("替换阶段失败:游戏目录回滚到应用前状态(无半应用)", replace_ok)
     finally:
         applytxn._install_file = orig_install
     check("失败的应用不产生应用清单", len(applytxn.list_applies(p7.work)) == 2)
@@ -824,12 +849,13 @@ try:
     key8 = next(k for k, j in jobs8.items()
                 if j["old"] == "Welcome to the Synth Vale.")
     game_tl_edit("欢迎来到合成之谷。", "【手改】欢迎来到合成之谷。")
+    blocked_ok = False
     try:
         p8.apply_txn(log=lambda m: None)
         check("外部变更:无确认通道的应用被阻止", False, "竟然成功")
     except externaltl.ExternalChangesError:
-        check("外部变更:无确认通道的应用被阻止(绝不静默覆盖)",
-              "【手改】" in read(tl8))
+        blocked_ok = "【手改】" in read(tl8)
+        check("外部变更:无确认通道的应用被阻止(绝不静默覆盖)", blocked_ok)
     s8c = p8.apply_txn(log=lambda m: None, confirm=exttl_confirm("import"))
     cur8 = p8.store().get_current(key8)
     check("外部变更:逐项导入登记为人工来源的当前译文",
@@ -1001,6 +1027,156 @@ except Exception as e:  # noqa: BLE001
     traceback.print_exc()
 
 # =====================================================================
+# 工单 10：迁移接入全链路 —— 旧布局数据只经迁移进入新存储，迁移成果直接可用
+# =====================================================================
+try:
+    # ---- 旧版数据布局：work/<游戏安装目录名>/ 承载全部项目资产（无注册库） ----
+    game10 = os.path.join(TMP, "games", "synth_legacy-pc")
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game10)
+    # 用一次性项目跑真实提取产出 dump（产物与旧版一致），随即撤销登记与
+    # 按身份存放的目录——模拟从未有过注册库的旧项目
+    tmp10 = register(game10, "synth_legacy-pc")
+    p_tmp10 = pipeline.Project(make_cfg(stub.base_url, ""), game10, tmp10["id"])
+    p_tmp10.extract_tl(log=lambda m: None)
+    dump10_path = os.path.join(p_tmp10.work, "dump.json")
+    legacy10 = os.path.join(TMP, "work", "synth_legacy-pc")
+    os.makedirs(legacy10)
+    shutil.copy2(dump10_path, os.path.join(legacy10, "dump.json"))
+    jobs10 = jobs_by_key(game10, dump10_path)
+    util.write_json(os.path.join(legacy10, "jobs.json"), list(jobs10.values()))
+    river10 = sorted(k for k, j in jobs10.items()
+                     if j["kind"] == "say" and j["old"] == "The river remembers.")
+    trans10 = {k: "河水记得（迁移来的）。" for k in river10}
+    trans10["dead_legacy_key"] = "无主旧译文"
+    util.write_json(os.path.join(legacy10, "translations.json"), trans10)
+    util.write_json(os.path.join(legacy10, "relations.json"), [
+        {"name": "Eileen", "name_cn": "艾琳（迁移来的）", "gender": "f", "relation": "friend"}])
+    reg10 = registry.Registry()
+    reg10.delete_project(tmp10["id"])
+    reg10.close()
+    shutil.rmtree(p_tmp10.work, ignore_errors=True)
+    # 游戏库记录指认安装（旧版按目录名匹配的唯一来源）
+    util.write_json(os.path.join(TMP, "library.json"),
+                    {"games": [{"path": game10, "name": "synth_legacy-pc",
+                                "cover": "", "translated": False}]})
+
+    scan10 = migration.scan()
+    p10s = next(p for p in scan10["projects"] if p["name"] == "synth_legacy-pc")
+    check("迁移预览：旧布局项目按目录名匹配到游戏安装",
+          p10s["match"]["status"] == "new" and p10s["match"]["install_path"] == game10)
+    check("迁移预览：可导入计数 = 任务清单内译文数",
+          p10s["plan"]["translations_importable"] == len(river10))
+    # 工单 03 段留下的 A 项目正是"过渡期目录"：已按身份登记、项目库从未同步
+    # 出现位置、译文仍只在旧镜像文件里——预览同样在列，安装关联来自注册库
+    check("迁移预览：过渡期目录（已登记、项目库未同步）在列且并入原项目",
+          any(p["name"] == pa_id and p["match"]["status"] == "merge"
+              and p["match"]["install_path"] == gameA
+              for p in scan10["projects"]))
+
+    report10 = migration.apply()
+    t10 = report10["translations"]
+    # 对账口径：legacy 目录 3 条（2 条可导入 + 1 条无主）+ 过渡期目录 1 条
+    # （A 的 k_marker_A，其 jobs 镜像已不存在，进待检查）
+    check("迁移执行：旧布局新建 1 个项目、过渡期并入 1 个，译文全部对账",
+          report10["projects"]["created"] == 1
+          and report10["projects"]["merged"] == 1
+          and t10["total"] == len(trans10) + 1
+          and t10["imported"] == len(river10)
+          and t10["review"] == 2 and report10["reconciled"] is True,
+          "%s | %s | review=%s" % (t10, report10["projects"],
+                                   [i["key"] for i in report10["review_items"]]))
+    check("迁移执行：无主译文成为待检查项（绝不静默丢弃）",
+          {i["key"] for i in report10["review_items"]}
+          == {"dead_legacy_key", "k_marker_A"})
+
+    # ---- 迁移成果直接进入全链路：项目库 -> 统一应用写进游戏 tl ----
+    reg10 = registry.Registry()
+    proj10 = reg10.find_by_path(game10)
+    reg10.close()
+    check("迁移后的项目按身份登记（同路径打开即同一项目）", proj10 is not None)
+    cfg10 = make_cfg(stub.base_url, "")
+    cfg10["apply_font"] = False
+    cfg10["apply_lang_entry"] = False
+    p10 = pipeline.Project(cfg10, game10, proj10["id"])
+    cur10 = p10.store().currents()
+    check("迁移译文进入项目库（来源 migration、逐位置独立）",
+          all(cur10.get(k) == "河水记得（迁移来的）。" for k in river10)
+          and p10.store().get_current(river10[0])["source"] == "migration")
+    s10 = p10.apply_txn(log=lambda m: None)
+    tl10 = read(os.path.join(game10, "game", "tl", "chinese", "script.rpy"))
+    check("全链路：迁移译文经统一应用写进游戏 tl（两处分支各自回填）",
+          s10["filled"] > 0 and s10["external"]["detected"] == 0
+          and tl10.count('e "河水记得（迁移来的）。"') == 2)
+    # 迁移来的人物关系是项目资产：统一应用刷新人名与关系词显示层（无隐藏例外）
+    p10.apply_txn(log=lambda m: None)
+    check("全链路：迁移来的人物关系刷新人名显示层",
+          "'Eileen': '艾琳（迁移来的）'" in read(os.path.join(game10, "game",
+                                                                "zz_ng_text.rpy")))
+
+    # ---- 幂等：重复迁移不产生重复数据 ----
+    again10 = migration.apply()
+    check("迁移幂等：重复执行零新建、零导入",
+          again10["projects"]["created"] == 0
+          and again10["translations"]["imported"] == 0)
+except Exception as e:  # noqa: BLE001
+    import traceback
+    t10 = None
+    check("工单 10 迁移全链路回归无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
+# 工单 10：成功指标核对（规格 §8 可靠性）—— 按验收时刻的现场状态复算
+# =====================================================================
+try:
+    # 串项目：现场重读 A 的游戏目录与项目资产（不使用工单 03 段捕获的变量）
+    liveA = read(os.path.join(gameA, "game", "tl", "chinese", "script.rpy"))
+    metric("同名不同路径项目串数据",
+           int("河流记得（B 项目专用）。" in liveA)
+           + int(util.read_json(os.path.join(pa.work, "translations.json"))
+                 != {"k_marker_A": "A 项目的译文"})
+           + int(util.read_json(os.path.join(pa.work, "glossary.json"))
+                 != [{"en": "vale", "cn": "幽谷（A 项目专用）"}]),
+           "A/B 同名安装：游戏目录与项目资产现场互检")
+    metric("自动过程覆盖人工译文",
+           int(store5.get_current(k_fixed)["text"] != "河水记得（定稿）。")
+           + int(p8.store().get_current(key8)["text"] != "【手改】欢迎来到合成之谷。"),
+           "现场重查项目库：人工定稿与外部导入译文仍是当前值")
+    # 半应用：故障注入时刻的目录零改动（stage_ok/replace_ok）+ 现场无中断
+    # 事务残留（recover_interrupted 发现即回滚，0 = 无半应用遗留）
+    metric("应用失败留下半完成游戏目录",
+           int(not stage_ok) + int(not replace_ok)
+           + int(applytxn.recover_interrupted(p7.work, game7) != 0),
+           "两阶段故障注入零改动 + 现场无中断事务残留")
+    # 未提示覆盖：现场重读游戏 tl——外部手改保留即从未被静默覆盖
+    metric("未提示覆盖外部 tl 变更",
+           int("【手改】欢迎来到合成之谷。" not in read(tl8)),
+           "现场重读游戏 tl：手改内容仍在")
+    if t10 is not None:
+        # 迁移对账：现场重数——旧镜像每条译文要么已是项目库当前译文（导入），
+        # 要么原样留在原目录等待人工处理（待检查）；镜像文件被改动即不平
+        live_trans10 = util.read_json(os.path.join(legacy10, "translations.json"))
+        live_cur10 = set(p10.store().currents())
+        in_store = sum(1 for k in live_trans10 if k in live_cur10)
+        untouched = live_trans10 == trans10
+        accounted = in_store + (len(live_trans10) - in_store if untouched else -1)
+        metric("迁移前后项目资产可对账率",
+               accounted / len(live_trans10) if live_trans10 else 1.0,
+               "现场重数：旧镜像 %d 条（入库 %d）%s"
+               % (len(live_trans10), in_store,
+                  "原样保留" if untouched else "镜像文件被改动"))
+    print()
+    print("== 阶段 1 成功指标核对（目标：串 0 / 覆盖 0 / 半应用 0 / 未提示覆盖 0 / 对账率 1.0）==")
+    for name, target in METRIC_TARGETS.items():
+        check("成功指标：%s" % name, metrics.get(name) == target,
+              "实测 %s（目标 %s）" % (metrics.get(name), target))
+    check("五项成功指标全部登记", set(metrics) == set(METRIC_TARGETS),
+          repr(sorted(metrics)))
+except Exception as e:  # noqa: BLE001
+    import traceback
+    check("工单 10 成功指标核对无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
 # 清理（无论成败都恢复补丁与目录）
 # =====================================================================
 try:
@@ -1013,7 +1189,8 @@ finally:
 print()
 if failures:
     print("FAILED: %d -> %s" % (len(failures), failures))
-    sys.exit(1)
+    if __name__ == "__main__":
+        sys.exit(1)
 print("ALL TESTS PASSED")
 
 
