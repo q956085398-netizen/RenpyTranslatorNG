@@ -26,7 +26,7 @@ import threading
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from core import coordinator, extract, ipatch, pipeline, project_store, registry, tlgen, util  # noqa: E402
+from core import applytxn, coordinator, extract, ipatch, pipeline, project_store, registry, tlgen, util  # noqa: E402
 from tests import syntheng, stubserver  # noqa: E402
 
 failures = []
@@ -455,7 +455,7 @@ try:
     check("两个项目对同一源文本得到结构一致的任务清单", len(riverB) == 2, repr(riverB))
     util.write_json(os.path.join(pb.work, "translations.json"),
                     {k: "河流记得（B 项目专用）。" for k in riverB})
-    pb.fill_partial(log=lambda m: None)
+    pb.apply_txn(log=lambda m: None)
 
     contentA = read(os.path.join(gameA, "game", "tl", "chinese", "script.rpy"))
     contentB = read(os.path.join(gameB, "game", "tl", "chinese", "script.rpy"))
@@ -660,6 +660,109 @@ try:
 except Exception as e:  # noqa: BLE001
     import traceback
     check("工单 06 协调器回归无异常", False, "%s: %s" % (type(e).__name__, e))
+    traceback.print_exc()
+
+# =====================================================================
+# 工单 07:事务式应用与恢复 —— 暂存/检查/替换故障注入、恢复点、停用汉化
+# =====================================================================
+try:
+    game7 = os.path.join(TMP, "games", "synth_basic_apply")
+    shutil.copytree(os.path.join(GAMES_SRC, "synth_basic"), game7)
+    cfg7 = make_cfg(stub.base_url, FONT_PATH)
+    p7 = make_project(cfg7, game7, "synth_basic_apply")
+    p7.extract_tl(log=lambda m: None)
+    p7.translate(log=lambda m: None)   # stub 服务连接翻译(项目库提交 + 回填)
+
+    # 玩家自己的文件在基线之前就存在:停用绝不触碰
+    with open(os.path.join(game7, "game", "player_mod.rpy"), "w",
+              encoding="utf-8") as f:
+        f.write("# 玩家自己的文件\n")
+    tree7 = {k: v for k, v in applytxn.snapshot_tree(game7).items()
+             if not k.startswith("game/fonts_ng_backup/")}   # 应用前基线
+
+    s7 = p7.apply_txn(log=lambda m: None)
+    g7 = os.path.join(game7, "game")
+    check("应用事务器:任务摘要可验证(成功/跳过/待检查)",
+          s7["filled"] > 0 and s7["untranslated"] == 0 and s7["dropped"] == 0
+          and s7["files_total"] > 0 and s7["fonts_replaced"] == 1, s7["filled"])
+    check("应用事务器:译文+显示层+字体+语言入口一并生效",
+          "欢迎来到合成之谷。" in read(os.path.join(g7, "tl", "chinese", "script.rpy"))
+          and os.path.isfile(os.path.join(g7, "zz_ng_text.rpy"))
+          and read(os.path.join(g7, "fonts", "myfont.ttf")) == "NG-TEST-FONT-BYTES"
+          and 'Language("chinese")' in read(os.path.join(g7, "zz_ng_language.rpy")))
+    m7 = applytxn.list_applies(p7.work)
+    check("应用事务器:应用清单与恢复点生成(带归属与前后哈希)",
+          len(m7) == 1 and m7[0]["apply_id"] == s7["apply_id"]
+          and {"tl", "font", "lang_entry", "text_helpers"}
+          <= {e["owner"] for e in m7[0]["files"]}
+          and all(e.get("after") for e in m7[0]["files"]
+                  if e["action"] != "removed"))
+
+    # 二次应用:改人名译法后显示层随译文刷新(无隐藏例外)
+    util.write_json(os.path.join(p7.work, "relations.json"), [
+        {"name": "Eileen", "name_cn": "小艾", "gender": "f", "relation": "friend"},
+        {"name": "Marisol", "name_cn": "玛丽索", "gender": "f", "relation": "friend"}])
+    s7b = p7.apply_txn(log=lambda m: None)
+    text7 = read(os.path.join(g7, "zz_ng_text.rpy"))
+    check("二次应用刷新人名与关系词显示层(不存在隐藏例外)",
+          "'Eileen': '小艾'" in text7 and "'艾琳'" not in text7
+          and len(applytxn.list_applies(p7.work)) == 2,
+          s7b["apply_id"])
+    applied7 = {k: v for k, v in applytxn.snapshot_tree(game7).items()
+                if not k.startswith("game/fonts_ng_backup/")}
+
+    # ---- 故障注入:暂存/替换阶段失败,游戏目录保持应用前状态 ----
+    cfg7["font_path"] = os.path.join(TMP, "missing.ttf")
+    try:
+        p7.apply_txn(log=lambda m: None)
+        check("暂存阶段失败:应用中止", False, "竟然成功")
+    except applytxn.ApplyError:
+        check("暂存阶段失败:应用中止且游戏目录零改动",
+              {k: v for k, v in applytxn.snapshot_tree(game7).items()
+               if not k.startswith("game/fonts_ng_backup/")} == applied7)
+    cfg7["font_path"] = FONT_PATH
+
+    orig_install = applytxn._install_file
+    calls = {"n": 0}
+
+    def flaky_install(game_base, entry):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise OSError("e2e 注入:替换第 3 个文件时故障")
+        return orig_install(game_base, entry)
+
+    applytxn._install_file = flaky_install
+    try:
+        p7.apply_txn(log=lambda m: None)
+        check("替换阶段失败:回滚", False, "竟然成功")
+    except OSError:
+        check("替换阶段失败:游戏目录回滚到应用前状态(无半应用)",
+              {k: v for k, v in applytxn.snapshot_tree(game7).items()
+               if not k.startswith("game/fonts_ng_backup/")} == applied7)
+    finally:
+        applytxn._install_file = orig_install
+    check("失败的应用不产生应用清单", len(applytxn.list_applies(p7.work)) == 2)
+
+    # ---- 停用汉化:只撤销工具管理的文件,项目资产保留 ----
+    # 期望 = 应用前基线(含玩家文件与提取写的运行时过滤器——后者是 uipatch
+    # 改写脚本的运行时依赖,停用时保留)
+    expect7 = dict(tree7)
+    r7 = applytxn.deactivate(p7.work, game7, cfg7, "chinese", log=lambda m: None)
+    after7 = {k: v for k, v in applytxn.snapshot_tree(game7).items()
+              if not k.startswith("game/fonts_ng_backup/")}
+    check("停用汉化:游戏目录回到应用前(玩家文件不动、原字体还原、工具文件清理)",
+          after7 == expect7 and os.path.isfile(os.path.join(g7, "player_mod.rpy"))
+          and read(os.path.join(g7, "fonts", "myfont.ttf")) != "NG-TEST-FONT-BYTES",
+          r7)
+    check("停用汉化:汉化项目及其资产保留(译文在库、恢复点在)",
+          p7.store().currents() and len(applytxn.list_applies(p7.work)) == 2)
+    s7c = p7.apply_txn(log=lambda m: None)
+    check("停用后再次应用即恢复汉化",
+          "欢迎来到合成之谷。" in read(os.path.join(g7, "tl", "chinese", "script.rpy"))
+          and s7c["apply_id"] not in (s7["apply_id"], s7b["apply_id"]))
+except Exception as e:  # noqa: BLE001
+    import traceback
+    check("工单 07 应用事务回归无异常", False, "%s: %s" % (type(e).__name__, e))
     traceback.print_exc()
 
 # =====================================================================

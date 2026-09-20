@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """RenpyTranslatorNG 主界面。"""
+import difflib
 import html
 import json
 import os
@@ -17,13 +18,14 @@ from PySide6.QtGui import (QBrush, QColor, QIcon, QLinearGradient, QPainter,
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
     QFileDialog, QFormLayout, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QScrollArea, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core.config import Config
 from core.pipeline import Project
+from core import applytxn
 from core import coordinator
 from core import fontpatch
 from core import library as gamelib
@@ -55,6 +57,13 @@ def project_task(kind):
         fn._project_task_kind = kind
         return fn
     return deco
+
+
+def apply_summary_msg(s):
+    """应用事务器摘要 -> 界面/任务行消息(core.applytxn 统一格式 + 恢复点号)。"""
+    if s.get("stopped"):
+        return "已在应用前暂停（游戏目录未改动）"
+    return "%s；恢复点 %s" % (applytxn.summary_message(s), s["apply_id"])
 
 
 def _hl(text, kw):
@@ -352,6 +361,175 @@ class RelationsDialog(QDialog):
         return t
 
 
+class ApplyPointsDialog(QDialog):
+    """恢复点管理（工单 07）：查看每次应用的差异、还原到应用前、一键停用汉化。"""
+
+    ACTION_LABELS = {"added": "新增", "modified": "修改", "removed": "移除"}
+    OWNER_LABELS = {"tl": "译文", "font": "字体", "lang_entry": "语言入口",
+                    "text_helpers": "人名与关系词显示层", "legacy_cleanup": "旧版遗留"}
+
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("恢复点 / 停用汉化")
+        self.resize(900, 600)
+        self.main = main
+        p = main._project()
+        self.work, self.game_base = p.work, p.game_base
+        self.applies = applytxn.list_applies(self.work)
+
+        lv = QVBoxLayout(self)
+        hint = QLabel("每次「应用到游戏」生成一个恢复点（应用清单 + 替换前字节）。"
+                      "还原建议从最新开始连续撤销；停用汉化会按全部清单依次撤销并清理"
+                      "工具文件——汉化项目与译文资产不受影响，再次应用即恢复。")
+        hint.setWordWrap(True)
+        hint.setObjectName("dim")
+        lv.addWidget(hint)
+
+        split = QSplitter()
+        self.lst = QListWidget()
+        if not self.applies:
+            self.lst.addItem("尚无应用记录（执行一次「应用到游戏」后生成）")
+        for m in self.applies:
+            s = m.get("summary") or {}
+            self.lst.addItem("应用 %s   回填 %s 条 · 文件 %d 个%s" % (
+                m["apply_id"], s.get("filled", "?"), len(m.get("files") or []),
+                "（最新）" if m is self.applies[0] else ""))
+        self.lst.currentRowChanged.connect(self._load_files)
+        split.addWidget(self.lst)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        self.tbl = QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["文件（相对游戏目录）", "动作", "归属"])
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tbl.setColumnWidth(1, 70)
+        self.tbl.setColumnWidth(2, 160)
+        self.tbl.itemSelectionChanged.connect(self._show_diff)
+        rv.addWidget(self.tbl, 2)
+        self.diff = QPlainTextEdit()
+        self.diff.setReadOnly(True)
+        self.diff.setPlaceholderText("选中一个文件查看差异（应用前 ←→ 当前）")
+        rv.addWidget(self.diff, 3)
+        split.addWidget(right)
+        split.setStretchFactor(1, 1)
+        split.setSizes([260, 640])
+        lv.addWidget(split, 1)
+
+        row = QHBoxLayout()
+        btn_restore = QPushButton("⤺ 还原到此应用之前")
+        btn_restore.setObjectName("primary")
+        btn_restore.clicked.connect(self._restore)
+        btn_off = QPushButton("⏹ 停用汉化")
+        btn_off.clicked.connect(self._deactivate)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.reject)
+        row.addWidget(btn_restore)
+        row.addWidget(btn_off)
+        row.addStretch(1)
+        row.addWidget(btn_close)
+        lv.addLayout(row)
+        if self.applies:
+            self.lst.setCurrentRow(0)
+
+    def _current(self):
+        i = self.lst.currentRow()
+        if 0 <= i < len(self.applies):
+            return self.applies[i]
+        return None
+
+    def _load_files(self, row):
+        self.tbl.setRowCount(0)
+        self.diff.clear()
+        m = self._current()
+        if not m:
+            return
+        for e in m.get("files") or []:
+            r = self.tbl.rowCount()
+            self.tbl.insertRow(r)
+            self.tbl.setItem(r, 0, QTableWidgetItem(e["path"]))
+            self.tbl.setItem(r, 1, QTableWidgetItem(
+                self.ACTION_LABELS.get(e["action"], e["action"])))
+            self.tbl.setItem(r, 2, QTableWidgetItem(
+                self.OWNER_LABELS.get(e["owner"], e["owner"])))
+
+    def _show_diff(self):
+        self.diff.clear()
+        m = self._current()
+        rows = self.tbl.selectionModel().selectedRows()
+        if not m or not rows:
+            return
+        e = (m.get("files") or [])[rows[0].row()]
+        try:
+            report = applytxn.diff(self.work, self.game_base, m["apply_id"])
+            row = next(r for r in report["files"] if r["path"] == e["path"])
+        except Exception:
+            self.diff.setPlainText("差异信息读取失败：%s" % e["path"])
+            return
+        parts = ["%s（%s / %s）" % (e["path"],
+                                   self.ACTION_LABELS.get(e["action"], e["action"]),
+                                   self.OWNER_LABELS.get(e["owner"], e["owner"]))]
+        if row.get("backup"):
+            before = self._read_text(row["backup"])
+            if row.get("current_is_after"):
+                # 行级差异:应用前(恢复点备份) vs 当前(即该次应用后)
+                diff = list(difflib.unified_diff(
+                    before.splitlines(), self._read_text(row["current"]).splitlines(),
+                    fromfile="应用前", tofile="应用后", lineterm=""))
+                parts.append(self._head("差异（- 应用前 / + 应用后）"))
+                parts.append("\n".join(diff) if diff else "（两个版本内容相同）")
+            else:
+                parts.append(self._head("应用前（恢复点备份）"))
+                parts.append(before)
+        else:
+            parts.append(self._head("应用前：该文件是本次应用新增，此前不存在"))
+        if not row.get("current"):
+            parts.append("（该文件当前不在游戏目录中——已被还原、停用或移除）")
+        elif not row.get("current_is_after") and not row.get("backup"):
+            parts.append(self._head("当前游戏目录"))
+            parts.append(self._read_text(row["current"]))
+        self.diff.setPlainText("\n".join(parts))
+
+    @staticmethod
+    def _head(t):
+        return "—— %s ——\n" % t
+
+    @staticmethod
+    def _read_text(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError as e:
+            return "（无法读取：%s）" % e
+
+    def _restore(self):
+        m = self._current()
+        if not m:
+            return
+        ret = QMessageBox.question(
+            self, "还原恢复点",
+            "把游戏目录还原到应用 %s 之前？\n该次应用（以及其后未再撤销的应用成果）"
+            "会被覆盖；恢复点本身保留。" % m["apply_id"],
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        self.accept()
+        self.main._run(self.main._restore_op(m["apply_id"]))
+
+    def _deactivate(self):
+        ret = QMessageBox.question(
+            self, "停用汉化",
+            "停用当前游戏安装上的汉化？\n只撤销工具管理的文件（tl 译文、字体、语言入口、"
+            "显示层脚本）；\n汉化项目、译文、恢复点全部保留，再次「应用到游戏」即恢复。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        self.accept()
+        self.main._run(self.main._op_deactivate)
+
+
 class MainWindow(QMainWindow):
     sig_est = Signal(str)  # 工作线程里安全更新“统计工作量”标签
 
@@ -548,7 +726,7 @@ class MainWindow(QMainWindow):
             ("extract", "3. 提取+生成tl", "运行一次游戏提取对白并生成翻译骨架"),
             ("scan", "4. AI关系草表", "用模型分析角色关系，生成后请在③页审核"),
             ("translate", "5. 翻译并回填", "调用 API 翻译全部文本并写入 tl\n自动续翻：已译过的行直接跳过，可随时暂停后接着翻"),
-            ("finish", "6. 字体+语言+角色名", "中文字体全覆盖 + 设置内语言切换 + 角色中文名"),
+            ("finish", "6. 应用到游戏", "事务式统一应用：回填译文 + 中文字体 + 语言入口 + 角色中文名\n暂存生成→结构检查→统一替换；失败自动回滚，生成恢复点"),
         ]):
             b = QPushButton(text)
             b.setToolTip(tip)
@@ -564,9 +742,11 @@ class MainWindow(QMainWindow):
         run_all.clicked.connect(self._run_all)
         cv.addWidget(run_all)
         row_util = QHBoxLayout()
-        self.btn_fill = QPushButton("⤵ 回填已译部分（试玩模式）")
+        self.btn_fill = QPushButton("⤵ 应用到游戏（试玩模式）")
         self.btn_fill.setToolTip(
-            "不调用 API、不花钱：把当前已翻译的译文写入 tl 并应用字体/语言入口。\n"
+            "不调用 API、不花钱：把当前已翻译的译文写入 tl，并统一应用字体、语言入口、"
+            "人名与关系词显示层。\n事务式：暂存生成 → 结构检查 → 统一替换，任何阶段失败"
+            "游戏目录保持应用前状态；\n每次应用生成恢复点，可随时还原或停用汉化。\n"
             "未翻译的行在游戏里显示英文原文——先试玩一部分，再决定是否继续翻译。")
         self.btn_fill.clicked.connect(lambda: self._run(self._op_fill))
         self.btn_retrans = QPushButton("↻ 重译未译句子")
@@ -574,8 +754,14 @@ class MainWindow(QMainWindow):
             "修复翻译失败：只把缓存里没有译文的句子重新发给 AI（已译内容绝不重复请求，最省钱），\n"
             "每句至多附前后各 1 句上下文；完成后自动回填。反复执行可逐步清零失败句。")
         self.btn_retrans.clicked.connect(lambda: self._run(self._op_retrans))
+        self.btn_applypts = QPushButton("🧯 恢复点 / 停用汉化")
+        self.btn_applypts.setToolTip(
+            "查看每次应用的恢复点（哪些文件被谁改过、差异预览），可还原到某次应用之前，\n"
+            "或一键停用汉化——只撤销工具管理的文件，汉化项目与译文资产全部保留。")
+        self.btn_applypts.clicked.connect(self._open_apply_points)
         row_util.addWidget(self.btn_fill)
         row_util.addWidget(self.btn_retrans)
+        row_util.addWidget(self.btn_applypts)
         row_util.addStretch(1)
         cv.addLayout(row_util)
         v.addWidget(card, 0)
@@ -1065,12 +1251,10 @@ class MainWindow(QMainWindow):
         self.ed_font = QLineEdit()
         bf = QPushButton("浏览…")
         bf.clicked.connect(self._pick_font)
-        bapply = QPushButton("仅应用字体")
-        bapply.setToolTip("把上面选的字体立即应用到所选游戏，无需重新提取/翻译")
-        bapply.clicked.connect(lambda: self._run(self._op_font_only))
+        bf.setToolTip("选择中文字体后,到「① 流程」页执行「⤵ 应用到游戏」生效\n"
+                      "(统一应用:字体与译文、显示层、语言入口一并事务式生效)")
         rowf.addWidget(self.ed_font, 1)
         rowf.addWidget(bf)
-        rowf.addWidget(bapply)
         f3.addRow("中文字体", rowf)
         self.ed_f95cookie = QLineEdit()
         self.ed_f95cookie.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1606,6 +1790,22 @@ class MainWindow(QMainWindow):
         else:
             self._toast("译文缓存已清空（备份为 translations.json.bak），重跑第5步即全文重译")
 
+    def _open_apply_points(self):
+        """恢复点 / 停用汉化（工单 07）：需要已登记的项目与游戏目录。"""
+        try:
+            p = self._project()
+        except Exception as e:
+            QMessageBox.warning(self, "错误", str(e))
+            return
+        if not os.path.isdir(os.path.join(p.game_base, "game")):
+            QMessageBox.warning(self, "错误", "游戏目录不可用：%s" % p.game_base)
+            return
+        # 与运行中的项目任务互斥：还原/停用与应用都改游戏目录，不并行
+        if coordinator.TaskCoordinator(p.store()).is_busy():
+            self._toast("有项目任务正在运行，请等它结束后再操作恢复点")
+            return
+        ApplyPointsDialog(self, self).exec()
+
     @project_task("全流程")
     def _op_all(self, log, prog, stop, confirm=None):
         p = self._project()
@@ -1646,12 +1846,9 @@ class MainWindow(QMainWindow):
             if not use_relations and os.path.isfile(rel_bak):
                 os.replace(rel_bak, rel_path)
         paused = stop()
-        p.apply_font(log)
-        p.apply_lang_entry(log)
-        if use_relations:
-            p.apply_names(log)
+        p.apply_txn(log)
         if paused:
-            return "已暂停：已译部分已回填 tl，可先试玩；继续翻译请再执行第 5 步（自动续翻）"
+            return "已暂停：已译部分已应用（可先试玩）；继续翻译请再执行第 5 步（自动续翻）"
         return "全流程完成"
 
     @project_task("准备")
@@ -1682,8 +1879,8 @@ class MainWindow(QMainWindow):
 
     @project_task("回填")
     def _op_fill(self, log, prog, stop, confirm=None):
-        n, missing = self._project().fill_partial(log)
-        return "已回填 %d 条译文（未译 %d 条显示英文），可以试玩了" % (n, missing)
+        s = self._project().apply_txn(log)
+        return apply_summary_msg(s)
 
     @project_task("翻译")
     def _op_retrans(self, log, prog, stop, confirm=None):
@@ -1704,16 +1901,26 @@ class MainWindow(QMainWindow):
 
     @project_task("应用")
     def _op_finish(self, log, prog, stop, confirm=None):
-        p = self._project()
-        p.apply_font(log)
-        p.apply_lang_entry(log)
-        p.apply_names(log)
-        return "字体、语言入口、人名映射、输入助手已应用"
+        s = self._project().apply_txn(log)
+        return apply_summary_msg(s)
 
     @project_task("应用")
-    def _op_font_only(self, log, prog, stop, confirm=None):
-        self._project().apply_font(log)
-        return "字体已应用（无需重新翻译）"
+    def _op_deactivate(self, log, prog, stop, confirm=None):
+        """停用汉化:只撤销工具管理的文件,汉化项目与全部资产保留。"""
+        p = self._project()
+        s = applytxn.deactivate(p.work, p.game_base, p.cfg, p.language, log)
+        return ("汉化已停用（撤销/清理 %d 个工具管理的文件）；译文与恢复点都在，"
+                "再次「应用到游戏」即恢复汉化" % s["files"])
+
+    def _restore_op(self, apply_id):
+        """还原到某次应用之前（恢复点对话框触发）。"""
+        @project_task("应用")
+        def op(log, prog, stop, confirm=None):
+            p = self._project()
+            s = applytxn.restore(p.work, p.game_base, apply_id, log)
+            return "已还原到应用 %s 之前（%d 个文件；恢复点保留）" % (
+                apply_id, s["files"])
+        return op
 
     @project_task("统计")
     def _op_estimate(self, log, prog, stop, confirm=None):

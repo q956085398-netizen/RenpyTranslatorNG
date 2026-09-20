@@ -4,7 +4,7 @@ import os
 import shutil
 import time
 
-from . import decompile, extract, fontpatch, ipatch, project_store, pystrings, relations, texttags, tlgen, uipatch
+from . import applytxn, decompile, extract, fontpatch, ipatch, project_store, pystrings, relations, texttags, tlgen, uipatch
 from . import translator as xlator
 from . import unrpa
 from .util import fmt_exc, read_json, store_dir, write_json
@@ -257,14 +257,20 @@ class Project:
                 log("ipatch 补丁覆盖：%d 条翻译源已替换为补丁后文本（译文仍按原文写回 tl）" % n)
         self.store().sync_occurrences(self._occurrence_records(jobs))
         if not self.cfg.get("translate_strings", True):
-            # 任务范围不含 strings：回填文件清单也与 include_strings=False 的
-            # 既有语义一致（纯 strings 文件不进入回填）
+            # 任务范围不含 strings(strings 文件仍在暂存集里随应用统一替换,
+            # 只是不回填——回填过滤见 _fillable_files)
             jobs = [j for j in jobs if j["kind"] != "string"]
-            keep = {j["file"] for j in jobs}
-            tl_dir = os.path.join(self.game_base, "game", "tl", self.language)
-            tl_files = [p for p in tl_files if os.path.relpath(p, tl_dir) in keep]
         write_json(os.path.join(self.work, "jobs.json"), jobs)
         return jobs, tl_files
+
+    def _fillable_files(self, tl_files, jobs):
+        """要回填的 tl 文件:translate_strings 关闭时纯 strings 文件不回填
+        (既有语义;文件本身仍属于统一应用的暂存集)。"""
+        if self.cfg.get("translate_strings", True):
+            return tl_files
+        keep = {j["file"] for j in jobs}
+        tl_dir = os.path.join(self.game_base, "game", "tl", self.language)
+        return [p for p in tl_files if os.path.relpath(p, tl_dir) in keep]
 
     def estimate(self, log):
         jobs, _ = self._jobs(log)
@@ -290,7 +296,8 @@ class Project:
                                    progress=progress, should_stop=should_stop)
         dropped = []
         text_map, key_map = _expand_translations(jobs, store.currents(), dropped=dropped)
-        n = tlgen.fill_translations(tl_files, text_map, key_map)
+        n = tlgen.fill_translations(self._fillable_files(tl_files, jobs),
+                                  text_map, key_map)
         missing = sum(1 for j in jobs if j["old"]
                     and (j.get("orig") or j["old"]) not in text_map)
         log("回填 %d 条译文，剩余未译 %d 条（未译部分显示英文原文；可再次执行续翻）" % (n, missing))
@@ -326,7 +333,8 @@ class Project:
         self._translate_into_store(log, store, missing, seed,
                                    progress=progress, should_stop=should_stop)
         text_map, key_map = _expand_translations(jobs, store.currents())
-        n = tlgen.fill_translations(tl_files, text_map, key_map)
+        n = tlgen.fill_translations(self._fillable_files(tl_files, jobs),
+                                  text_map, key_map)
         missing_after = sum(1 for j in jobs if j["old"]
                           and (j.get("orig") or j["old"]) not in text_map)
         log("回填 %d 条译文，剩余未译 %d 条（可再次执行本步继续修复）" % (n, missing_after))
@@ -342,20 +350,37 @@ class Project:
                 "候选译文、带冲突说明）：可在「④ 译文修改」比较后采用或忽略"
                 % len(conflicts))
 
-    def fill_partial(self, log):
-        """不调用 API：把项目库里的当前译文回填进 tl（未译行保持英文显示），
-        并应用字体/语言入口，用于翻译一部分后先试玩游戏再决定是否继续。"""
+    def apply_txn(self, log, should_stop=None):
+        """「应用到游戏」:事务式统一应用(core.applytxn,工单 07)。
+
+        暂存生成(回填 tl + 人名与关系词显示层 + 字体 + 语言入口)→ 快速结构
+        检查 → 统一替换 → 应用清单/恢复点;任何阶段失败游戏目录保持应用前
+        状态。出现位置同步与旧缓存导入都在本应用任务内完成(译文映射取自
+        项目库当前译文)。
+        """
         jobs, tl_files = self._jobs(log)
         store = self._import_legacy_cache(log)
-        text_map, key_map = _expand_translations(jobs, store.currents())
-        n = tlgen.fill_translations(tl_files, text_map, key_map)
+        dropped = []
+        text_map, key_map = _expand_translations(jobs, store.currents(), dropped=dropped)
         missing = sum(1 for j in jobs if j["old"]
-                    and (j.get("orig") or j["old"]) not in text_map)
-        self.apply_font(log)
-        self.apply_lang_entry(log)
-        log("试玩模式：已回填 %d 条；未译 %d 条在游戏中显示英文原文" % (n, missing))
-        log("想继续翻译：直接再执行第 5 步，会从剩余部分接着翻，不重复已译内容")
-        return n, missing
+                      and (j.get("orig") or j["old"]) not in text_map)
+        fill_files = self._fillable_files(tl_files, jobs)
+        try:
+            dump = self.load_dump()
+        except Exception:
+            dump = None    # 没有 dump 时显示层退回纯关系表模式(与 apply_names 一致)
+        summary = applytxn.run(
+            self.game_base, self.work, self.language, self.cfg, text_map, key_map,
+            keep_files=tl_files, fill_files=fill_files,
+            relations=self.load_relations(),
+            relation_words=self.load_relation_words(), dump=dump,
+            untranslated=missing, dropped=len(dropped),
+            suggestions=store.stats()["suggestions"],
+            log=log, should_stop=should_stop)
+        if dropped and not summary.get("stopped"):
+            log("⚠ %d 条译文含原文没有的 [变量](运行时必崩),本次应用已拒用、"
+                "这些行继续显示英文:改对变量名后重新应用即可" % len(dropped))
+        return summary
 
     def apply_font(self, log):
         if self.cfg.get("apply_font", True):

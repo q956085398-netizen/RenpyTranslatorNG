@@ -73,6 +73,43 @@ def restore_fonts(game_base, log=print):
     log("已还原 %d 个游戏字体文件" % n)
 
 
+def fonts_to_replace(gamedir, cjk_font_name):
+    """游戏引用字体中需要物理替换的清单（相对 game 的路径，排除我们的中文字体）。"""
+    ours = os.path.normcase(os.path.join(gamedir, "fonts", cjk_font_name))
+    return [ref for ref in _referenced_fonts(gamedir)
+            if os.path.normcase(os.path.join(gamedir, *ref.split("/"))) != ours]
+
+
+def replace_fonts_in_place(gamedir, cjk_font_path, refs=None):
+    """物理替换游戏自带字体（先备份进 game/fonts_ng_backup）。返回替换个数。
+
+    应用事务器在替换阶段调用：调用方先把每个目标的替换前字节收进恢复点，
+    这里的 fonts_ng_backup 是游戏目录内的本地安全网（restore_fonts 与
+    设置→数据维护的恢复入口都读它）。"""
+    with open(cjk_font_path, "rb") as f:
+        cjk = f.read()
+    if refs is None:
+        refs = fonts_to_replace(gamedir, os.path.basename(cjk_font_path))
+    bak = os.path.join(gamedir, _BACKUP_DIR)
+    n = 0
+    for ref in refs:
+        target = os.path.join(gamedir, *ref.split("/"))
+        rel = ref.replace("/", os.sep)
+        bpath = os.path.join(bak, rel)
+        if not os.path.isfile(bpath):
+            os.makedirs(os.path.dirname(bpath), exist_ok=True)
+            shutil.copy2(target, bpath)
+        with open(target, "wb") as f:
+            f.write(cjk)
+        n += 1
+    return n
+
+
+def font_override_content(language, font_name):
+    """tl 字体覆盖脚本内容（apply_font 与应用事务器暂存区共用）。"""
+    return FONT_OVERRIDE_TEMPLATE.format(lang=language, name=font_name)
+
+
 def apply_font(game_base, language, font_path, log=print):
     if not font_path or not os.path.isfile(font_path):
         raise RuntimeError("字体文件不存在: %s" % font_path)
@@ -90,26 +127,10 @@ def apply_font(game_base, language, font_path, log=print):
     rpy = os.path.join(tl_dir, "zz_ng_font.rpy")
     _drop(rpy + "c")
     with open(rpy, "w", encoding="utf-8") as f:
-        f.write(FONT_OVERRIDE_TEMPLATE.format(lang=language, name=name))
+        f.write(font_override_content(language, name))
 
     # 2) 物理替换游戏自带字体（备份到 fonts_ng_backup，用于彻底杜绝方块）
-    with open(dst, "rb") as f:
-        cjk = f.read()
-    bak = os.path.join(gamedir, _BACKUP_DIR)
-    n = 0
-    for ref in _referenced_fonts(gamedir):
-        target = os.path.join(gamedir, *ref.split("/"))
-        keep = os.path.normcase(target) == os.path.normcase(dst)
-        if keep:
-            continue
-        rel = ref.replace("/", os.sep)
-        bpath = os.path.join(bak, rel)
-        if not os.path.isfile(bpath):
-            os.makedirs(os.path.dirname(bpath), exist_ok=True)
-            shutil.copy2(target, bpath)
-        with open(target, "wb") as f:
-            f.write(cjk)
-        n += 1
+    n = replace_fonts_in_place(gamedir, dst)
     log("字体覆盖完成：样式已写入 tl/%s/zz_ng_font.rpy；物理替换 %d 个游戏字体（备份在 game/%s，可随时还原）"
         % (language, n, _BACKUP_DIR))
 
@@ -171,13 +192,24 @@ init 1010 python:
 '''
 
 
+def default_lang_name(language):
+    """语言入口上显示的语言名(未显式指定时)。"""
+    return {"chinese": "中文"}.get(language, language)
+
+
+def lang_entry_content(language, lang_name=None):
+    """语言切换入口脚本内容（apply_lang_entry 与应用事务器暂存区共用）。"""
+    name = lang_name or default_lang_name(language)
+    return LANG_ENTRY_TEMPLATE.format(lang=language, lang_name=name)
+
+
 def apply_lang_entry(game_base, language, lang_name=None, log=print):
     gamedir = os.path.join(game_base, "game")
     rpy = os.path.join(gamedir, "zz_ng_language.rpy")
     _drop(rpy + "c")
-    name = lang_name or {"chinese": "中文"}.get(language, language)
+    name = lang_name or default_lang_name(language)
     with open(rpy, "w", encoding="utf-8") as f:
-        f.write(LANG_ENTRY_TEMPLATE.format(lang=language, lang_name=name))
+        f.write(lang_entry_content(language, name))
     log("语言入口已写入：设置界面底部（English / %s）" % name)
 
 
@@ -211,9 +243,8 @@ _DEFINE_CHAR = re.compile(
 _ITEM_DEF = re.compile(r'\bItem\(\s*["\']((?:[^"\'\\]|\\.)*)["\']')
 
 
-def _tl_string_map(game_base, language):
-    """读 tl/<lang> 全部 strings 词条 old->new，供物品名等静态数据取译名。"""
-    tl_dir = os.path.join(game_base, "game", "tl", language)
+def _tl_string_map(tl_dir):
+    """读一份 tl 目录全部 strings 词条 old->new，供物品名等静态数据取译名。"""
     out = {}
     if not os.path.isdir(tl_dir):
         return out
@@ -568,8 +599,12 @@ def relation_words_map(words):
     return out
 
 
-def apply_text_helpers(game_base, language, relations, log=print, dump=None, words=None):
-    """统一写 zz_ng_text.rpy：人名显示映射 + 关系词显示表 + 自定义输入助手。
+def text_helpers_content(game_base, language, relations, dump=None, words=None,
+                         tl_dir=None):
+    """生成 zz_ng_text.rpy 的完整内容（人名映射 + 关系词显示表 + 输入助手）。
+
+    应用事务器在暂存区调用：tl_dir 指向暂存区的 tl 目录——物品名译名取本次
+    应用的 strings（暂存副本），而不是游戏目录里上一次应用留下的旧表。
 
     人名映射的键必须是游戏里实际显示的名字才会在对话框生效：
     - 优先用 define xx = Character("Name") 解析出的真实人名（可靠）；
@@ -631,7 +666,7 @@ def apply_text_helpers(game_base, language, relations, log=print, dump=None, wor
     #    （"你给过她：[items]" 的插值发生在 replace_text 之前之后均可兜住），
     #    译名从 tl strings 表取，表里没有的保持英文
     try:
-        tl_map = _tl_string_map(game_base, language)
+        tl_map = _tl_string_map(tl_dir or os.path.join(gamedir, "tl", language))
         if tl_map:
             for root, _dirs, files in os.walk(gamedir):
                 if _BACKUP_DIR in root or os.sep + "tl" + os.sep in root + os.sep:
@@ -655,8 +690,6 @@ def apply_text_helpers(game_base, language, relations, log=print, dump=None, wor
     except Exception:
         pass
 
-    rpy = os.path.join(gamedir, "zz_ng_text.rpy")
-    _drop(rpy + "c")
     wmap = relation_words_map(words)
     content = (TEXT_HELPERS_TEMPLATE.replace("__NG_LANG__", language)
                .replace("__NG_NAMES__", repr(mapping))
@@ -677,12 +710,23 @@ def apply_text_helpers(game_base, language, relations, log=print, dump=None, wor
     compile("\n".join(block), "zz_ng_text.rpy", "exec")
     if "\x08" in content:
         raise RuntimeError("模板中混入控制字符，请检查 fontpatch 模板转义")
+    return content, mapping
+
+
+def apply_text_helpers(game_base, language, relations, log=print, dump=None, words=None):
+    """统一写 zz_ng_text.rpy：人名显示映射 + 关系词显示表 + 自定义输入助手。"""
+    gamedir = os.path.join(game_base, "game")
+    content, mapping = text_helpers_content(game_base, language, relations,
+                                            dump=dump, words=words)
+    rpy = os.path.join(gamedir, "zz_ng_text.rpy")
+    _drop(rpy + "c")
     with open(rpy, "w", encoding="utf-8") as f:
         f.write(content)
     # 清理旧版文件
     for legacy in ("zz_ng_names.rpy", "zz_ng_input.rpy"):
         _drop(os.path.join(gamedir, legacy))
         _drop(os.path.join(gamedir, legacy) + "c")
+    wmap = relation_words_map(words)
     if mapping:
         log("文本映射已写入：%d 个人名（如 %s）%s + 关系词输入助手"
             % (len(mapping), "，".join("%s→%s" % kv for kv in list(mapping.items())[:4]),
